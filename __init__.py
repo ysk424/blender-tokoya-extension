@@ -108,6 +108,31 @@ class HAIR_SIM_OT_reset(Operator):
         return {"FINISHED"}
 
 
+# Phase 2C experimental probe. INTERNAL = hidden from operator search
+# and not bound to any UI button; triggered only via bpy.ops or MCP.
+# Independent of SolverInterface and frame_change_post by design.
+class HAIR_SIM_OT_probe_native(Operator):
+    bl_idname      = "hair_sim.probe_native"
+    bl_label       = "Probe Native (Phase 2C)"
+    bl_description = "Probe the experimental native module via the loader"
+    bl_options     = {"INTERNAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import _native_loader
+        native = _native_loader.get_native()
+        if native is None:
+            self.report({"ERROR"}, "Native module not available")
+            return {"CANCELLED"}
+        try:
+            value = native.add(2, 3)
+            phase = native.phase
+        except Exception as exc:
+            self.report({"ERROR"}, f"Native call failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Native probe ok: phase={phase} add(2,3)={value}")
+        return {"FINISHED"}
+
+
 # --------------------------------------------------------------------------- #
 # Register
 # --------------------------------------------------------------------------- #
@@ -116,6 +141,7 @@ _classes = (
     HAIR_SIM_OT_start,
     HAIR_SIM_OT_stop,
     HAIR_SIM_OT_reset,
+    HAIR_SIM_OT_probe_native,
 )
 
 

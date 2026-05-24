@@ -17,4 +17,5 @@ tags = ["Physics"]
 paths = [
     "__init__.py",
     "ui.py",
+    "_native_loader.py",
 ]
