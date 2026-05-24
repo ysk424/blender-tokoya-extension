@@ -1,6 +1,6 @@
-// Phase 2B/4A/4B/4C/5A/5B placeholder module. Module name, function
-// names, and phase attribute are experimental and will change before
-// any real solver wiring.
+// Phase 2B/4A/4B/4C/5A/5B/5C placeholder module. Module name,
+// function names, and phase attribute are experimental and will
+// change before any real solver wiring.
 //
 // Phase history of this file:
 //   4A: describe_curves           (metadata round-trip only)
@@ -14,6 +14,11 @@
 //   5B: physx_probe_step          (empty-Scene simulate(dt)/fetchResults;
 //                                  still no rigid bodies, no collision,
 //                                  no Curves, no GPU)
+//   5C: physx_probe_create_rigid_scene / get_actor_pose
+//                                 (PhysX-internal ground plane + dynamic
+//                                  sphere falling under gravity; still
+//                                  no Curves, no collision body read,
+//                                  no SolverInterface, no GPU)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
@@ -278,6 +283,11 @@ PxMaterial*              g_material    = nullptr;
 unsigned long long       g_step_count  = 0ULL;
 float                    g_last_dt     = 0.0f;
 
+// Phase 5C: minimal rigid scene actors. Owned by the PxScene once added;
+// released in physx_probe_close() before scene teardown.
+PxRigidStatic*           g_ground_static  = nullptr;
+PxRigidDynamic*          g_dynamic_actor  = nullptr;
+
 }  // anonymous namespace
 
 py::dict physx_probe_open()
@@ -364,20 +374,29 @@ py::dict physx_probe_status()
     const bool has_material   = (g_material   != nullptr);
     const bool opened         = has_foundation;
 
+    const bool has_dynamic_actor = (g_dynamic_actor != nullptr);
+    const bool has_ground_static = (g_ground_static != nullptr);
+    const bool has_rigid_scene   = has_dynamic_actor;
+
     py::dict d;
-    // Phase 5B status surface.
-    d["opened"]         = opened;
-    d["state"]          = opened ? "opened" : "closed";
-    d["step_count"]     = g_step_count;
-    d["last_dt"]        = g_last_dt;
-    d["gpu_enabled"]    = false;
-    d["has_foundation"] = has_foundation;
-    d["has_physics"]    = has_physics;
-    d["has_dispatcher"] = has_dispatcher;
-    d["has_scene"]      = has_scene;
-    d["has_material"]   = has_material;
-    d["message"]        = opened
-        ? "PhysX context open (empty scene; no rigid bodies)"
+    // Phase 5B/5C status surface.
+    d["opened"]              = opened;
+    d["state"]               = opened ? "opened" : "closed";
+    d["step_count"]          = g_step_count;
+    d["last_dt"]             = g_last_dt;
+    d["gpu_enabled"]         = false;
+    d["has_foundation"]      = has_foundation;
+    d["has_physics"]         = has_physics;
+    d["has_dispatcher"]      = has_dispatcher;
+    d["has_scene"]           = has_scene;
+    d["has_material"]        = has_material;
+    d["has_rigid_scene"]     = has_rigid_scene;
+    d["dynamic_actor_count"] = has_dynamic_actor ? 1 : 0;
+    d["static_actor_count"]  = has_ground_static ? 1 : 0;
+    d["message"]             = opened
+        ? (has_rigid_scene
+               ? "PhysX context open with rigid scene (ground + dynamic sphere)"
+               : "PhysX context open (empty scene; no rigid bodies)")
         : "PhysX context closed";
 
     // Phase 5A back-compat fields (kept so older probe scripts keep working).
@@ -389,19 +408,146 @@ py::dict physx_probe_status()
     return d;
 }
 
-// Phase 5B: empty-Scene simulate(dt) + fetchResults(true). No rigid
-// bodies, no shapes, no collision, no Curves, no GPU. Just confirms
-// PhysX can advance the simulation pipeline by one frame.
+// Phase 5C: dynamic sphere initial position and geometry. PhysX-internal
+// coordinates only; no Blender mapping is implied here.
+namespace {
+constexpr float  kDynamicRadius      = 0.5f;
+constexpr float  kDynamicInitialY    = 10.0f;
+constexpr float  kDynamicDensity     = 1.0f;
+}  // anonymous namespace
+
+// Phase 5C: create the minimal rigid scene inside the already-open
+// PxScene: one infinite static ground plane (normal +Y at y=0) and one
+// dynamic sphere at (0, 10, 0). Gravity comes from the scene that
+// physx_probe_open() configured, i.e. (0, -9.81, 0). No Blender data is
+// touched.
+py::dict physx_probe_create_rigid_scene()
+{
+    py::dict d;
+    const bool is_open =
+        (g_foundation != nullptr) &&
+        (g_physics    != nullptr) &&
+        (g_scene      != nullptr) &&
+        (g_material   != nullptr);
+
+    if (!is_open) {
+        d["accepted"]        = false;
+        d["has_rigid_scene"] = false;
+        d["message"]         = "rejected: PhysX context not fully open (need foundation/physics/scene/material)";
+        return d;
+    }
+
+    if (g_dynamic_actor != nullptr || g_ground_static != nullptr) {
+        const PxVec3 g = g_scene->getGravity();
+        d["accepted"]            = true;
+        d["already_created"]     = true;
+        d["has_rigid_scene"]     = true;
+        d["dynamic_actor_count"] = (g_dynamic_actor != nullptr) ? 1 : 0;
+        d["static_actor_count"]  = (g_ground_static != nullptr) ? 1 : 0;
+        d["gravity"]             = py::make_tuple(g.x, g.y, g.z);
+        d["gravity_axis"]        = "-Y";
+        d["message"]             = "rigid scene already created (no-op)";
+        return d;
+    }
+
+    // Ground plane: n=(0,1,0), d=0 -> y=0
+    g_ground_static = PxCreatePlane(*g_physics, PxPlane(0.0f, 1.0f, 0.0f, 0.0f), *g_material);
+    if (g_ground_static == nullptr) {
+        d["accepted"]        = false;
+        d["has_rigid_scene"] = false;
+        d["message"]         = "PxCreatePlane failed";
+        return d;
+    }
+    g_scene->addActor(*g_ground_static);
+
+    // Dynamic sphere at (0, 10, 0). Damping zero so free fall is
+    // analytically predictable in the test.
+    const PxTransform dyn_pose(PxVec3(0.0f, kDynamicInitialY, 0.0f));
+    g_dynamic_actor = PxCreateDynamic(
+        *g_physics, dyn_pose,
+        PxSphereGeometry(kDynamicRadius),
+        *g_material, kDynamicDensity);
+    if (g_dynamic_actor == nullptr) {
+        g_ground_static->release();
+        g_ground_static = nullptr;
+        d["accepted"]        = false;
+        d["has_rigid_scene"] = false;
+        d["message"]         = "PxCreateDynamic failed; ground rolled back";
+        return d;
+    }
+    g_dynamic_actor->setLinearDamping(0.0f);
+    g_dynamic_actor->setAngularDamping(0.0f);
+    g_scene->addActor(*g_dynamic_actor);
+
+    const PxVec3 g = g_scene->getGravity();
+
+    d["accepted"]                 = true;
+    d["already_created"]          = false;
+    d["has_rigid_scene"]          = true;
+    d["dynamic_actor_count"]      = 1;
+    d["static_actor_count"]       = 1;
+    d["dynamic_geometry"]         = std::string("PxSphereGeometry(radius=0.5)");
+    d["dynamic_initial_position"] = py::make_tuple(dyn_pose.p.x, dyn_pose.p.y, dyn_pose.p.z);
+    d["dynamic_density"]          = kDynamicDensity;
+    d["ground_plane"]             = std::string("PxPlane(n=(0,1,0), d=0)");
+    d["gravity"]                  = py::make_tuple(g.x, g.y, g.z);
+    d["gravity_axis"]             = "-Y";
+    d["message"]                  = "rigid scene created (ground plane + dynamic sphere @ y=10)";
+    return d;
+}
+
+// Phase 5C: read-only pose snapshot of the dynamic actor. No raw
+// PhysX pointers cross the boundary.
+py::dict physx_probe_get_actor_pose()
+{
+    py::dict d;
+    const bool is_open = (g_foundation != nullptr && g_scene != nullptr);
+    if (!is_open) {
+        d["accepted"]        = false;
+        d["has_rigid_scene"] = false;
+        d["message"]         = "rejected: PhysX context not open";
+        return d;
+    }
+    if (g_dynamic_actor == nullptr) {
+        d["accepted"]        = false;
+        d["has_rigid_scene"] = false;
+        d["message"]         = "rejected: rigid scene not created (call physx_probe_create_rigid_scene first)";
+        return d;
+    }
+
+    const PxTransform pose = g_dynamic_actor->getGlobalPose();
+    const PxVec3      vel  = g_dynamic_actor->getLinearVelocity();
+    const PxVec3      g    = g_scene->getGravity();
+
+    d["accepted"]        = true;
+    d["has_rigid_scene"] = true;
+    d["position"]        = py::make_tuple(pose.p.x, pose.p.y, pose.p.z);
+    d["orientation_xyzw"] = py::make_tuple(pose.q.x, pose.q.y, pose.q.z, pose.q.w);
+    d["linear_velocity"] = py::make_tuple(vel.x, vel.y, vel.z);
+    d["gravity"]         = py::make_tuple(g.x, g.y, g.z);
+    d["gravity_axis"]    = "-Y";
+    d["step_count"]      = g_step_count;
+    d["message"]         = "actor pose snapshot";
+    return d;
+}
+
+// Phase 5B/5C: empty-or-rigid Scene simulate(dt) + fetchResults(true).
+// When a rigid scene is present (Phase 5C), capture before/after pose
+// and linear velocity of the dynamic actor.
 py::dict physx_probe_step(float dt)
 {
     const bool is_open =
         (g_foundation != nullptr) &&
         (g_physics    != nullptr) &&
         (g_scene      != nullptr);
+    const bool has_rigid_scene = (g_dynamic_actor != nullptr);
 
     py::dict d;
     d["accepted"]              = false;
     d["opened"]                = is_open;
+    d["has_rigid_scene"]       = has_rigid_scene;
+    d["dynamic_actor_count"]   = (g_dynamic_actor != nullptr) ? 1 : 0;
+    d["static_actor_count"]    = (g_ground_static != nullptr) ? 1 : 0;
     d["dt"]                    = dt;
     d["step_count_before"]     = g_step_count;
     d["step_count_after"]      = g_step_count;
@@ -416,6 +562,15 @@ py::dict physx_probe_step(float dt)
     if (!(dt > 0.0f)) {
         d["message"] = "rejected: dt must be > 0 (got non-positive or NaN)";
         return d;
+    }
+
+    // Capture pre-step pose/velocity if a rigid scene exists.
+    PxVec3 pos_before(0.0f, 0.0f, 0.0f);
+    PxVec3 vel_before(0.0f, 0.0f, 0.0f);
+    if (has_rigid_scene) {
+        const PxTransform t = g_dynamic_actor->getGlobalPose();
+        pos_before = t.p;
+        vel_before = g_dynamic_actor->getLinearVelocity();
     }
 
     bool simulate_ok = false;
@@ -442,7 +597,9 @@ py::dict physx_probe_step(float dt)
         d["accepted"]         = true;
         d["step_count_after"] = g_step_count;
         d["last_dt"]          = g_last_dt;
-        d["message"]          = "simulate(dt) + fetchResults(true) succeeded on empty scene";
+        d["message"]          = has_rigid_scene
+            ? "simulate(dt) + fetchResults(true) succeeded; pose advanced"
+            : "simulate(dt) + fetchResults(true) succeeded on empty scene";
     } else {
         d["accepted"] = false;
         d["step_count_after"] = g_step_count;
@@ -450,6 +607,18 @@ py::dict physx_probe_step(float dt)
         d["message"] = err_msg.empty()
             ? std::string("simulate or fetchResults did not complete (no exception captured)")
             : err_msg;
+    }
+
+    if (has_rigid_scene) {
+        const PxTransform t_after = g_dynamic_actor->getGlobalPose();
+        const PxVec3      v_after = g_dynamic_actor->getLinearVelocity();
+        const PxVec3      g_vec   = g_scene->getGravity();
+        d["actor_position_before"] = py::make_tuple(pos_before.x, pos_before.y, pos_before.z);
+        d["actor_position_after"]  = py::make_tuple(t_after.p.x,  t_after.p.y,  t_after.p.z);
+        d["actor_velocity_before"] = py::make_tuple(vel_before.x, vel_before.y, vel_before.z);
+        d["actor_velocity_after"]  = py::make_tuple(v_after.x,    v_after.y,    v_after.z);
+        d["gravity"]               = py::make_tuple(g_vec.x, g_vec.y, g_vec.z);
+        d["gravity_axis"]          = "-Y";
     }
     return d;
 }
@@ -459,16 +628,32 @@ py::dict physx_probe_close()
     py::dict d;
 
     if (g_foundation == nullptr) {
-        d["accepted"]        = true;
-        d["already_closed"]  = true;
-        d["opened"]          = false;
-        d["step_count"]      = g_step_count;
-        d["last_dt"]         = g_last_dt;
-        d["message"]         = "PhysX context already closed";
+        d["accepted"]            = true;
+        d["already_closed"]      = true;
+        d["opened"]              = false;
+        d["step_count"]          = g_step_count;
+        d["last_dt"]             = g_last_dt;
+        d["has_rigid_scene"]     = false;
+        d["dynamic_actor_count"] = 0;
+        d["static_actor_count"]  = 0;
+        d["message"]             = "PhysX context already closed";
         return d;
     }
 
     // Release in reverse order of dependency.
+    //
+    // Phase 5C: rigid actors first. PxActor::release() removes the actor
+    // from its containing scene automatically, and the actor releases the
+    // shapes it owns. Shapes drop their material reference here, so the
+    // material must outlive them and is released next.
+    if (g_dynamic_actor != nullptr) {
+        g_dynamic_actor->release();
+        g_dynamic_actor = nullptr;
+    }
+    if (g_ground_static != nullptr) {
+        g_ground_static->release();
+        g_ground_static = nullptr;
+    }
     if (g_material != nullptr) {
         g_material->release();
         g_material = nullptr;
@@ -494,12 +679,15 @@ py::dict physx_probe_close()
     g_step_count = 0ULL;
     g_last_dt    = 0.0f;
 
-    d["accepted"]        = true;
-    d["already_closed"]  = false;
-    d["opened"]          = false;
-    d["step_count"]      = g_step_count;
-    d["last_dt"]         = g_last_dt;
-    d["message"]         = "PhysX context closed cleanly; all pointers nulled";
+    d["accepted"]            = true;
+    d["already_closed"]      = false;
+    d["opened"]              = false;
+    d["step_count"]          = g_step_count;
+    d["last_dt"]             = g_last_dt;
+    d["has_rigid_scene"]     = false;
+    d["dynamic_actor_count"] = 0;
+    d["static_actor_count"]  = 0;
+    d["message"]             = "PhysX context closed cleanly; all pointers nulled";
     return d;
 }
 
@@ -528,9 +716,11 @@ PYBIND11_MODULE(phase2b_probe, m) {
           py::arg("frame_current"),
           py::arg("amplitude"),
           py::arg("input_buf"));
-    m.def("physx_probe_open",   &physx_probe_open);
-    m.def("physx_probe_status", &physx_probe_status);
-    m.def("physx_probe_step",   &physx_probe_step,
+    m.def("physx_probe_open",                &physx_probe_open);
+    m.def("physx_probe_status",              &physx_probe_status);
+    m.def("physx_probe_create_rigid_scene",  &physx_probe_create_rigid_scene);
+    m.def("physx_probe_get_actor_pose",      &physx_probe_get_actor_pose);
+    m.def("physx_probe_step",                &physx_probe_step,
           py::arg("dt"));
-    m.def("physx_probe_close",  &physx_probe_close);
+    m.def("physx_probe_close",               &physx_probe_close);
 }
