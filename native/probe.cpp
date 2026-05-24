@@ -1,4 +1,4 @@
-// Phase 2B/4A/4B/4C/5A/5B/5C placeholder module. Module name,
+// Phase 2B/4A/4B/4C/5A/5B/5C/5D placeholder module. Module name,
 // function names, and phase attribute are experimental and will
 // change before any real solver wiring.
 //
@@ -19,9 +19,14 @@
 //                                  sphere falling under gravity; still
 //                                  no Curves, no collision body read,
 //                                  no SolverInterface, no GPU)
+//   5D: physx_probe_create_mesh_scene
+//                                 (C++-internal triangle mesh + dynamic
+//                                  sphere collides at y=9; no Blender
+//                                  mesh access, no Curves, no GPU)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
+#include <cooking/PxCooking.h>
 
 #include <cstddef>
 #include <exception>
@@ -288,6 +293,12 @@ float                    g_last_dt     = 0.0f;
 PxRigidStatic*           g_ground_static  = nullptr;
 PxRigidDynamic*          g_dynamic_actor  = nullptr;
 
+// Phase 5D: triangle-mesh scene state. g_triangle_mesh is reference
+// counted by PhysX; the mesh shape attached to g_ground_mesh_static
+// holds a reference, so the mesh must be released after that actor.
+PxRigidStatic*           g_ground_mesh_static = nullptr;
+PxTriangleMesh*          g_triangle_mesh      = nullptr;
+
 }  // anonymous namespace
 
 py::dict physx_probe_open()
@@ -374,12 +385,17 @@ py::dict physx_probe_status()
     const bool has_material   = (g_material   != nullptr);
     const bool opened         = has_foundation;
 
-    const bool has_dynamic_actor = (g_dynamic_actor != nullptr);
-    const bool has_ground_static = (g_ground_static != nullptr);
-    const bool has_rigid_scene   = has_dynamic_actor;
+    const bool has_dynamic_actor    = (g_dynamic_actor != nullptr);
+    const bool has_ground_static    = (g_ground_static != nullptr);
+    const bool has_ground_mesh      = (g_ground_mesh_static != nullptr);
+    const bool has_triangle_mesh    = (g_triangle_mesh != nullptr);
+    const bool has_rigid_scene      = has_dynamic_actor && has_ground_static;
+    const bool has_mesh_scene       = has_dynamic_actor && has_ground_mesh;
+    const int  static_actor_count   = (has_ground_static ? 1 : 0)
+                                    + (has_ground_mesh   ? 1 : 0);
 
     py::dict d;
-    // Phase 5B/5C status surface.
+    // Phase 5B/5C/5D status surface.
     d["opened"]              = opened;
     d["state"]               = opened ? "opened" : "closed";
     d["step_count"]          = g_step_count;
@@ -391,12 +407,16 @@ py::dict physx_probe_status()
     d["has_scene"]           = has_scene;
     d["has_material"]        = has_material;
     d["has_rigid_scene"]     = has_rigid_scene;
+    d["has_mesh_scene"]      = has_mesh_scene;
+    d["has_triangle_mesh"]   = has_triangle_mesh;
     d["dynamic_actor_count"] = has_dynamic_actor ? 1 : 0;
-    d["static_actor_count"]  = has_ground_static ? 1 : 0;
+    d["static_actor_count"]  = static_actor_count;
     d["message"]             = opened
-        ? (has_rigid_scene
-               ? "PhysX context open with rigid scene (ground + dynamic sphere)"
-               : "PhysX context open (empty scene; no rigid bodies)")
+        ? (has_mesh_scene
+               ? "PhysX context open with mesh scene (triangle mesh + dynamic sphere)"
+               : (has_rigid_scene
+                      ? "PhysX context open with rigid scene (ground plane + dynamic sphere)"
+                      : "PhysX context open (empty scene; no rigid bodies)"))
         : "PhysX context closed";
 
     // Phase 5A back-compat fields (kept so older probe scripts keep working).
@@ -434,6 +454,13 @@ py::dict physx_probe_create_rigid_scene()
         d["accepted"]        = false;
         d["has_rigid_scene"] = false;
         d["message"]         = "rejected: PhysX context not fully open (need foundation/physics/scene/material)";
+        return d;
+    }
+
+    if (g_ground_mesh_static != nullptr || g_triangle_mesh != nullptr) {
+        d["accepted"]        = false;
+        d["has_rigid_scene"] = false;
+        d["message"]         = "rejected: a mesh scene exists (close first to switch back to plane scene)";
         return d;
     }
 
@@ -496,6 +523,156 @@ py::dict physx_probe_create_rigid_scene()
     return d;
 }
 
+// Phase 5D: build a 4-vertex / 2-triangle horizontal mesh at y=9 (square
+// from x,z in [-5, +5]) via PhysX cooking, and a dynamic sphere @ y=10.
+// The mesh is single-sided; vertex winding is chosen so the surface
+// normal points +Y, facing the falling sphere.
+//
+// Spec triangles (0,1,2) and (0,2,3) produce -Y normals under PhysX's
+// right-hand rule (n = (v1-v0) x (v2-v0)); winding is flipped here to
+// (0,2,1) and (0,3,2) for +Y normals.
+py::dict physx_probe_create_mesh_scene()
+{
+    py::dict d;
+    const bool is_open =
+        (g_foundation != nullptr) &&
+        (g_physics    != nullptr) &&
+        (g_scene      != nullptr) &&
+        (g_material   != nullptr);
+
+    if (!is_open) {
+        d["accepted"]       = false;
+        d["has_mesh_scene"] = false;
+        d["message"]        = "rejected: PhysX context not fully open (need foundation/physics/scene/material)";
+        return d;
+    }
+
+    // Own mesh scene already present -> idempotent no-op. This must be
+    // checked before the cross-conflict guard below, because a mesh scene
+    // also owns g_dynamic_actor (shared with the Phase 5C plane path).
+    if (g_ground_mesh_static != nullptr || g_triangle_mesh != nullptr) {
+        const PxVec3 g = g_scene->getGravity();
+        d["accepted"]            = true;
+        d["already_created"]     = true;
+        d["has_mesh_scene"]      = true;
+        d["dynamic_actor_count"] = (g_dynamic_actor != nullptr) ? 1 : 0;
+        d["static_actor_count"]  = (g_ground_mesh_static != nullptr) ? 1 : 0;
+        d["gravity"]             = py::make_tuple(g.x, g.y, g.z);
+        d["gravity_axis"]        = "-Y";
+        d["message"]             = "mesh scene already created (no-op)";
+        return d;
+    }
+
+    // No mesh actor of our own, but a plane rigid scene is up -> reject.
+    if (g_dynamic_actor != nullptr || g_ground_static != nullptr) {
+        d["accepted"]       = false;
+        d["has_mesh_scene"] = false;
+        d["message"]        = "rejected: a plane rigid scene exists (close first to switch to mesh scene)";
+        return d;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Triangle mesh: 4 verts (square at y=9, side=10), 2 tris (+Y normal).
+    // ------------------------------------------------------------------ //
+    static const PxVec3 mesh_verts[4] = {
+        PxVec3(-5.0f, 9.0f, -5.0f),  // v0
+        PxVec3( 5.0f, 9.0f, -5.0f),  // v1
+        PxVec3( 5.0f, 9.0f,  5.0f),  // v2
+        PxVec3(-5.0f, 9.0f,  5.0f),  // v3
+    };
+    static const PxU32 mesh_indices[6] = {
+        0u, 2u, 1u,   // t0: +Y normal
+        0u, 3u, 2u,   // t1: +Y normal
+    };
+
+    PxTriangleMeshDesc mesh_desc;
+    mesh_desc.points.count     = 4u;
+    mesh_desc.points.stride    = sizeof(PxVec3);
+    mesh_desc.points.data      = mesh_verts;
+    mesh_desc.triangles.count  = 2u;
+    mesh_desc.triangles.stride = 3u * sizeof(PxU32);
+    mesh_desc.triangles.data   = mesh_indices;
+
+    PxCookingParams cook_params(g_physics->getTolerancesScale());
+    g_triangle_mesh = PxCreateTriangleMesh(
+        cook_params, mesh_desc, g_physics->getPhysicsInsertionCallback());
+    if (g_triangle_mesh == nullptr) {
+        d["accepted"]       = false;
+        d["has_mesh_scene"] = false;
+        d["message"]        = "PxCreateTriangleMesh failed";
+        return d;
+    }
+
+    // Static actor at identity transform (verts are already at y=9 in
+    // mesh-local space, which equals world here).
+    g_ground_mesh_static = g_physics->createRigidStatic(PxTransform(PxIdentity));
+    if (g_ground_mesh_static == nullptr) {
+        g_triangle_mesh->release();
+        g_triangle_mesh = nullptr;
+        d["accepted"]       = false;
+        d["has_mesh_scene"] = false;
+        d["message"]        = "createRigidStatic failed; triangle mesh rolled back";
+        return d;
+    }
+    PxTriangleMeshGeometry mesh_geom(g_triangle_mesh);
+    PxShape* mesh_shape = g_physics->createShape(mesh_geom, *g_material);
+    if (mesh_shape == nullptr) {
+        g_ground_mesh_static->release();
+        g_ground_mesh_static = nullptr;
+        g_triangle_mesh->release();
+        g_triangle_mesh = nullptr;
+        d["accepted"]       = false;
+        d["has_mesh_scene"] = false;
+        d["message"]        = "createShape(PxTriangleMeshGeometry) failed";
+        return d;
+    }
+    g_ground_mesh_static->attachShape(*mesh_shape);
+    // attachShape took its own reference; release our local handle so
+    // the shape's lifetime is owned by the actor.
+    mesh_shape->release();
+    g_scene->addActor(*g_ground_mesh_static);
+
+    // Dynamic sphere identical to Phase 5C config.
+    const PxTransform dyn_pose(PxVec3(0.0f, kDynamicInitialY, 0.0f));
+    g_dynamic_actor = PxCreateDynamic(
+        *g_physics, dyn_pose,
+        PxSphereGeometry(kDynamicRadius),
+        *g_material, kDynamicDensity);
+    if (g_dynamic_actor == nullptr) {
+        g_ground_mesh_static->release();
+        g_ground_mesh_static = nullptr;
+        g_triangle_mesh->release();
+        g_triangle_mesh = nullptr;
+        d["accepted"]       = false;
+        d["has_mesh_scene"] = false;
+        d["message"]        = "PxCreateDynamic failed; mesh actor rolled back";
+        return d;
+    }
+    g_dynamic_actor->setLinearDamping(0.0f);
+    g_dynamic_actor->setAngularDamping(0.0f);
+    g_scene->addActor(*g_dynamic_actor);
+
+    const PxVec3 g = g_scene->getGravity();
+
+    d["accepted"]                 = true;
+    d["already_created"]          = false;
+    d["has_mesh_scene"]           = true;
+    d["dynamic_actor_count"]      = 1;
+    d["static_actor_count"]       = 1;
+    d["dynamic_geometry"]         = std::string("PxSphereGeometry(radius=0.5)");
+    d["dynamic_initial_position"] = py::make_tuple(dyn_pose.p.x, dyn_pose.p.y, dyn_pose.p.z);
+    d["dynamic_density"]          = kDynamicDensity;
+    d["mesh_vertex_count"]        = 4;
+    d["mesh_triangle_count"]      = 2;
+    d["mesh_winding"]             = std::string("(0,2,1),(0,3,2) -> +Y normal");
+    d["mesh_y"]                   = 9.0f;
+    d["mesh_extent_xz"]           = 5.0f;
+    d["gravity"]                  = py::make_tuple(g.x, g.y, g.z);
+    d["gravity_axis"]             = "-Y";
+    d["message"]                  = "mesh scene created (cooked triangle mesh @ y=9 + dynamic sphere @ y=10)";
+    return d;
+}
+
 // Phase 5C: read-only pose snapshot of the dynamic actor. No raw
 // PhysX pointers cross the boundary.
 py::dict physx_probe_get_actor_pose()
@@ -540,14 +717,18 @@ py::dict physx_probe_step(float dt)
         (g_foundation != nullptr) &&
         (g_physics    != nullptr) &&
         (g_scene      != nullptr);
-    const bool has_rigid_scene = (g_dynamic_actor != nullptr);
+    const bool has_rigid_scene = (g_dynamic_actor != nullptr) && (g_ground_static != nullptr);
+    const bool has_mesh_scene  = (g_dynamic_actor != nullptr) && (g_ground_mesh_static != nullptr);
+    const bool has_actor       = (g_dynamic_actor != nullptr);
 
     py::dict d;
     d["accepted"]              = false;
     d["opened"]                = is_open;
     d["has_rigid_scene"]       = has_rigid_scene;
-    d["dynamic_actor_count"]   = (g_dynamic_actor != nullptr) ? 1 : 0;
-    d["static_actor_count"]    = (g_ground_static != nullptr) ? 1 : 0;
+    d["has_mesh_scene"]        = has_mesh_scene;
+    d["dynamic_actor_count"]   = has_actor ? 1 : 0;
+    d["static_actor_count"]    = (g_ground_static != nullptr ? 1 : 0)
+                               + (g_ground_mesh_static != nullptr ? 1 : 0);
     d["dt"]                    = dt;
     d["step_count_before"]     = g_step_count;
     d["step_count_after"]      = g_step_count;
@@ -564,10 +745,10 @@ py::dict physx_probe_step(float dt)
         return d;
     }
 
-    // Capture pre-step pose/velocity if a rigid scene exists.
+    // Capture pre-step pose/velocity whenever a dynamic actor exists.
     PxVec3 pos_before(0.0f, 0.0f, 0.0f);
     PxVec3 vel_before(0.0f, 0.0f, 0.0f);
-    if (has_rigid_scene) {
+    if (has_actor) {
         const PxTransform t = g_dynamic_actor->getGlobalPose();
         pos_before = t.p;
         vel_before = g_dynamic_actor->getLinearVelocity();
@@ -597,7 +778,7 @@ py::dict physx_probe_step(float dt)
         d["accepted"]         = true;
         d["step_count_after"] = g_step_count;
         d["last_dt"]          = g_last_dt;
-        d["message"]          = has_rigid_scene
+        d["message"]          = has_actor
             ? "simulate(dt) + fetchResults(true) succeeded; pose advanced"
             : "simulate(dt) + fetchResults(true) succeeded on empty scene";
     } else {
@@ -609,7 +790,7 @@ py::dict physx_probe_step(float dt)
             : err_msg;
     }
 
-    if (has_rigid_scene) {
+    if (has_actor) {
         const PxTransform t_after = g_dynamic_actor->getGlobalPose();
         const PxVec3      v_after = g_dynamic_actor->getLinearVelocity();
         const PxVec3      g_vec   = g_scene->getGravity();
@@ -634,6 +815,7 @@ py::dict physx_probe_close()
         d["step_count"]          = g_step_count;
         d["last_dt"]             = g_last_dt;
         d["has_rigid_scene"]     = false;
+        d["has_mesh_scene"]      = false;
         d["dynamic_actor_count"] = 0;
         d["static_actor_count"]  = 0;
         d["message"]             = "PhysX context already closed";
@@ -642,17 +824,28 @@ py::dict physx_probe_close()
 
     // Release in reverse order of dependency.
     //
-    // Phase 5C: rigid actors first. PxActor::release() removes the actor
-    // from its containing scene automatically, and the actor releases the
-    // shapes it owns. Shapes drop their material reference here, so the
-    // material must outlive them and is released next.
+    // Phase 5C/5D: rigid actors first. PxActor::release() removes the
+    // actor from its containing scene automatically, and the actor
+    // releases the shapes it owns. Shapes drop their material reference
+    // here, so the material must outlive them and is released after.
+    // The triangle mesh is reference counted: the mesh shape held a
+    // reference, so after the mesh actor releases its shape we drop the
+    // last reference explicitly.
     if (g_dynamic_actor != nullptr) {
         g_dynamic_actor->release();
         g_dynamic_actor = nullptr;
     }
+    if (g_ground_mesh_static != nullptr) {
+        g_ground_mesh_static->release();
+        g_ground_mesh_static = nullptr;
+    }
     if (g_ground_static != nullptr) {
         g_ground_static->release();
         g_ground_static = nullptr;
+    }
+    if (g_triangle_mesh != nullptr) {
+        g_triangle_mesh->release();
+        g_triangle_mesh = nullptr;
     }
     if (g_material != nullptr) {
         g_material->release();
@@ -685,6 +878,7 @@ py::dict physx_probe_close()
     d["step_count"]          = g_step_count;
     d["last_dt"]             = g_last_dt;
     d["has_rigid_scene"]     = false;
+    d["has_mesh_scene"]      = false;
     d["dynamic_actor_count"] = 0;
     d["static_actor_count"]  = 0;
     d["message"]             = "PhysX context closed cleanly; all pointers nulled";
@@ -719,6 +913,7 @@ PYBIND11_MODULE(phase2b_probe, m) {
     m.def("physx_probe_open",                &physx_probe_open);
     m.def("physx_probe_status",              &physx_probe_status);
     m.def("physx_probe_create_rigid_scene",  &physx_probe_create_rigid_scene);
+    m.def("physx_probe_create_mesh_scene",   &physx_probe_create_mesh_scene);
     m.def("physx_probe_get_actor_pose",      &physx_probe_get_actor_pose);
     m.def("physx_probe_step",                &physx_probe_step,
           py::arg("dt"));

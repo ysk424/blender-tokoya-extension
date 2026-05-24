@@ -58,6 +58,7 @@ def _load_from_path(pyd_path: str) -> ModuleType | None:
         import ctypes
         for dep_name in ("PhysXFoundation_64.dll",
                          "PhysXCommon_64.dll",
+                         "PhysXCooking_64.dll",
                          "PhysX_64.dll"):
             dep_path = os.path.join(pyd_dir, dep_name)
             if os.path.isfile(dep_path):

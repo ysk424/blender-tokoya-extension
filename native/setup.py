@@ -29,6 +29,7 @@ ext = Pybind11Extension(
         "PhysXFoundation_64",
         "PhysX_64",
         "PhysXCommon_64",
+        "PhysXCooking_64",          # Phase 5D: triangle mesh cooking
         "PhysXExtensions_static_64",
         "PhysXPvdSDK_static_64",
     ],

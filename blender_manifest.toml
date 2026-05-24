@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "hair_sim_physx"
-version = "0.0.11"
+version = "0.0.13"
 name = "Hair Simulation"
 tagline = "Hair simulation skeleton (Phase 1)"
 maintainer = "azoo <ysk424@hotmail.com>"
@@ -24,4 +24,5 @@ paths = [
     "native/PhysX_64.dll",
     "native/PhysXCommon_64.dll",
     "native/PhysXFoundation_64.dll",
+    "native/PhysXCooking_64.dll",
 ]
