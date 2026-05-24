@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "hair_sim_physx"
-version = "0.0.1"
+version = "0.0.4"
 name = "Hair Simulation"
 tagline = "Hair simulation skeleton (Phase 1)"
 maintainer = "azoo <ysk424@hotmail.com>"
@@ -13,9 +13,12 @@ license = ["SPDX:Apache-2.0"]
 
 tags = ["Physics"]
 
+platforms = ["windows-x64"]
+
 [build]
 paths = [
     "__init__.py",
     "ui.py",
     "_native_loader.py",
+    "native/phase2b_probe.cp313-win_amd64.pyd",
 ]
