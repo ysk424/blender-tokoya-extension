@@ -1,20 +1,15 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
+
+# venv
 .venv/
 .venv-*/
+
+# Build / package outputs
 build/
 dist/
-wheels/
-*.whl
-
-# CMake / build
-out/
-cmake-build-*/
-CMakeCache.txt
-CMakeFiles/
-CMakeUserPresets.json
+*.zip
 
 # IDE
 .vscode/
@@ -28,12 +23,3 @@ Thumbs.db
 # Blender
 *.blend1
 *.blend2
-
-# Extension build artifacts
-*.zip
-.blender_extension_build/
-
-# PhysX packman cache
-extern/PhysX/physx/bin/
-extern/PhysX/physx/compiler/
-extern/PhysX/physx/install/

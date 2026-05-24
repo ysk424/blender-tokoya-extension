@@ -2,8 +2,8 @@ schema_version = "1.0.0"
 
 id = "hair_sim_physx"
 version = "0.0.1"
-name = "PhysX Hair Simulation"
-tagline = "GPU hair simulation backend powered by NVIDIA PhysX 5"
+name = "Hair Simulation"
+tagline = "Hair simulation skeleton (Phase 1)"
 maintainer = "azoo <ysk424@hotmail.com>"
 type = "add-on"
 
@@ -12,9 +12,3 @@ blender_version_min = "5.1.0"
 license = ["SPDX:Apache-2.0"]
 
 tags = ["Physics"]
-
-platforms = ["windows-x64"]
-
-# Bundled wheels (filled in at build time by scripts/build_wheel.ps1).
-# wheels = ["./wheels/hair_sim_physx-0.0.1-cp313-cp313-win_amd64.whl"]
-wheels = []
