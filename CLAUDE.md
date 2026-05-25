@@ -5,6 +5,108 @@ Treat it as a living context document, updated when phases close.
 
 ---
 
+## ⚠️ START HERE — Direction change to VBD (2026-05-25 PM)
+
+**The active branch is now `vbd-direction`, not `main`.** Run
+`git branch` and check the asterisk. If you find yourself on `main`
+by mistake, the project's direction has changed and `main`'s HEAD
+(7e7f63a, Phase 7W-G) is no longer the working line.
+
+### Why the branch change
+
+1. PhysX PBD particle direction was **stopped** at Phase 7A-2 (PhysX
+   5.6.1 deprecated cloth-buffer API has a silent `nbTriangles >= 1`
+   precondition; spring-only hair configurations crash the process —
+   see the "PBD distance constraint blocker" section below).
+2. NVIDIA Warp lineage (Phase 7W-A through 7W-G) ran on `main` and
+   reached a working Verlet+PBD strand-chain solver that did achieve
+   gravity settling visually. The user then decided that the **final**
+   solver will be **NVIDIA Newton's built-in VBD** (Vertex Block
+   Descent) — not our hand-written Warp PBD. Possible Warp re-use for
+   body-mesh collision queries; the hand-written hair-strand kernels
+   are not.
+3. `main` was left at Phase 7W-G `7e7f63a` (preserved, not rebased,
+   not force-pushed). The new working line `vbd-direction` was
+   branched from **`499b92e` (Phase 7W-B)** — the last commit before
+   any hair-strand Warp kernels landed. That commit retains the
+   minimum Warp infrastructure (`_warp_kernels.py` with two trivial
+   probes) but `SolverInterface` is still wired to the Phase 6C C++
+   `NativeHairSolver` and no Warp hair kernels exist.
+
+### Current state on `vbd-direction`
+
+```
+* vbd-direction d15f953   Bump manifest to 0.0.25 to avoid overwriting prior builds
+                baefb55   VBD-prep: world-coord passthrough probe (no physics yet)
+                499b92e   Phase 7W-B: bundle Warp kernel module for Blender runtime  (base)
+                1c05cc5   Close Phase 7A-2 line: standalone diag result + NVIDIA Warp pivot
+                ...
+  main          7e7f63a   (frozen — Phase 7W-G line)
+```
+
+- **Active solver in `SolverInterface`**: `WorldPassthrough` (in
+  `_world_passthrough.py`). NO physics. Identity passthrough: read
+  Curves positions → convert to world via `obj.matrix_world` → call
+  dummy `_dummy_identity_simulation(world_np)` (returns input) →
+  convert back to local via `matrix_world.inverted()` → foreach_set
+  + update_tag. Exactly one frame_change_post call per Blender
+  frame change.
+- **Surface Deform GN modifier "サーフェス変形" is muted on Start**
+  (`mod.show_viewport = False`), restored on Stop. `unregister()`
+  calls `_solver.stop()` as a safety net.
+- **NVIDIA Newton 1.2.0** installed in Blender's bundled Python via
+  user site
+  (`C:\Users\azoo\AppData\Roaming\Python\Python313\site-packages\newton`).
+  Verified `newton.solvers.SolverVBD` exists and the empty-model
+  smoke test passed (CUDA narrow-phase kernels compile on
+  `cuda:0 = RTX 5070 Ti`).
+- **Bundled zip ready to install**: `dist/hair_sim_physx-0.0.25.zip`.
+  Prior builds (0.0.18–0.0.24) also still in `dist/`; install-from-
+  disk should pick `0.0.25` by version.
+
+### Open design question (left for tomorrow)
+
+When `WorldPassthrough.start()` mutes the Surface Deform GN modifier,
+the hair visually detaches from the head (sea-urchin cluster shifts
+~tens of cm away from the scalp in viewport). Image evidence captured
+on 2026-05-25 PM.
+
+This means the GN modifier does **more than** the ~1-2 cm per-point
+offset that earlier MCP probes (frame 1) measured: it appears to
+contain non-trivial logic that maps a "rest-pose" hair cluster onto
+the body's evaluated scalp surface. Muting it exposes the unmapped
+rest pose.
+
+Implication for VBD: VBD's anchor input must come from the
+**body-tracked head position**, not from the original Curves data
+block. The options on the table (no decision yet):
+
+| | approach | suitability |
+|---|---|---|
+| (a) | keep SD active; compute the SD per-anchor offset each frame and write `local_to_write = world_target − SD_offset` | math is workable but adds an inverse pass per frame |
+| (b) | snapshot evaluated anchors at Start while SD is still active, then mute SD and use the snapshot for the whole session | only works if the body does not animate per frame (this scene appears not to, but fragile) |
+| (c) | replace SD entirely: read body mesh evaluated vertices (e.g., via UV-anchored closest-vertex map) to compute anchor world positions | most robust; biggest engineering lift; this is the real VBD shape |
+| (d) | accept the identity-passthrough behaviour as a data-path verifier only; visual quality is not the bar today | what we are doing for today's mechanical test |
+
+Phase 1 invariants and the Phase 4D2 canonical round-trip rules
+**still apply on this branch**. They are not negated by the VBD
+pivot — they describe how the extension talks to Blender, not which
+solver runs inside.
+
+### What to do first when resuming
+
+1. Confirm branch: `git branch` → expect `* vbd-direction`.
+2. Confirm HEAD: `git log --oneline -1` → expect `d15f953`.
+3. If Blender is closed, the user will install
+   `dist/hair_sim_physx-0.0.25.zip` and bring up
+   `YOKO_EXT_TEST.blend`.
+4. Re-read the "Open design question" above and continue from one
+   of (a)/(b)/(c)/(d) per the user's decision.
+5. Do **not** push `vbd-direction` to `origin` without explicit GO.
+   `main` on `origin` is still at `7e7f63a`.
+
+---
+
 ## What this project is
 
 A Blender 5.1 extension that will eventually host a **NVIDIA PhysX**-backed
