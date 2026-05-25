@@ -201,7 +201,9 @@ class WorldPassthrough:
         local_h = world_h @ mw_inv.T
         local_pts = local_h[:, :3].astype(np.float32, copy=True)
 
-        attr.data.foreach_set("vector", local_pts.flatten().tolist())
+        # local_pts is C-contiguous (astype(copy=True) above), so ravel()
+        # returns a view; foreach_set accepts numpy arrays directly.
+        attr.data.foreach_set("vector", local_pts.ravel())
         obj.data.update_tag()
 
         # Sync the per-frame state holder so future +1 steps work.
@@ -221,29 +223,38 @@ class WorldPassthrough:
         self,
         scene: bpy.types.Scene,
         derive_velocity_from_prev: bool = False,
-    ) -> None:
+    ) -> bool:
         """Snapshot the current frame's full hair state (positions +
-        velocities, world coords). `_last_frame` and `_prev_state` are
-        updated atomically.
+        velocities, world coords).
+
+        **Atomicity guarantee** (load-bearing for physics correctness):
+        `_last_frame` and `_prev_state` are updated together at the end
+        of the function, or both are cleared to None on any failure.
+        They are NEVER left in a state where one reflects the new frame
+        and the other is stale or None. A future +1-frame step would
+        otherwise compute physics from inconsistent state.
 
         Velocity policy:
           derive_velocity_from_prev=True  → velocity = (new - prev) / dt
             Called only after a successful +1 simulation step.
           derive_velocity_from_prev=False → velocity = zeros
-            Start, frame-jump, and any re-baselining event."""
-        prior = self._prev_state
+            Start, frame-jump, and any re-baselining event.
 
+        Returns True if both fields were updated to the new captured
+        state, False if both were cleared to None due to a failure."""
+        prior = self._prev_state
         frame = scene.frame_current
-        self._last_frame = frame
 
         obj = bpy.data.objects.get(self._target_obj_name)
         if obj is None:
+            self._last_frame = None
             self._prev_state = None
-            return
+            return False
         attr = obj.data.attributes.get("position")
         if attr is None or len(attr.data) != self._n_total:
+            self._last_frame = None
             self._prev_state = None
-            return
+            return False
 
         n = self._n_total
 
@@ -271,11 +282,14 @@ class WorldPassthrough:
         else:
             velocities_world = np.zeros_like(world_pts)
 
+        # 4. Atomic commit: both fields updated together at the end.
         self._prev_state = HairFrameState(
             points_world     = world_pts,
             velocities_world = velocities_world,
             frame            = frame,
         )
+        self._last_frame = frame
+        return True
 
     # ----------------------------------------------------------- #
     # Simulation (placeholder — real VBD lands here)
@@ -317,7 +331,9 @@ class WorldPassthrough:
         attr = obj.data.attributes.get("position")
         if attr is None or len(attr.data) != n:
             return
-        attr.data.foreach_set("vector", local_pts.flatten().tolist())
+        # local_pts is C-contiguous (astype(copy=True) above), so ravel()
+        # returns a view; foreach_set accepts numpy arrays directly.
+        attr.data.foreach_set("vector", local_pts.ravel())
         obj.data.update_tag()
 
     # ----------------------------------------------------------- #
@@ -326,9 +342,15 @@ class WorldPassthrough:
 
     def start(self, obj, scene: bpy.types.Scene) -> bool:
         """Initialize / re-initialize the simulator at the current
-        frame. Allocates (or resizes / clears) the RAM bake, captures
-        the current frame as the initial state, and stores it in the
-        bake. Returns False on geometry sanity failure."""
+        frame. Allocates (or reuses) the RAM bake, captures the current
+        frame as the initial state, and stores it in the bake.
+
+        Returns False on any of:
+          * geometry sanity failure (wrong type, no attr, empty, non-uniform);
+          * `scene.frame_current` outside `[scene.frame_start, frame_end]`
+            (would silently bake nothing; reject explicitly so the user
+            knows to move into range first);
+          * initial-frame capture failure (e.g., attribute read failed)."""
         self._step_error_active = False
         self._initialized       = False
         self._last_frame        = None
@@ -353,6 +375,21 @@ class WorldPassthrough:
             )
             return False
 
+        # Bake-range check: current frame must be inside the animation
+        # range, otherwise the initial state cannot be baked and
+        # subsequent sim results would also fall outside the bake,
+        # leading to silent "sim runs but nothing baked" confusion.
+        fs = int(scene.frame_start)
+        fe = int(scene.frame_end)
+        fc = int(scene.frame_current)
+        if fc < fs or fc > fe:
+            print(
+                "[hair_sim/passthrough] start failed: "
+                f"current frame {fc} outside scene range [{fs}..{fe}] "
+                "(move the playhead inside the range and try again)"
+            )
+            return False
+
         self._target_obj_name = obj.name
         self._n_total         = n_total
         self._step_count      = 0
@@ -361,8 +398,12 @@ class WorldPassthrough:
         # Allocate (or reuse) the RAM bake. Clears mask either way.
         self._allocate_bake(scene)
 
-        # Capture and bake the initial frame.
-        self._capture_current_state(scene, derive_velocity_from_prev=False)
+        # Capture and bake the initial frame. If capture fails, abort
+        # cleanly so we never advertise initialized=True with no state.
+        if not self._capture_current_state(scene, derive_velocity_from_prev=False):
+            print("[hair_sim/passthrough] start failed: initial capture returned no state")
+            self._initialized = False
+            return False
         self._store_prev_state_to_bake()
 
         n_frames = self._bake_frame_end - self._bake_frame_start + 1

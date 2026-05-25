@@ -24,10 +24,16 @@ class SolverInterface:
 
     def start(self, scene: bpy.types.Scene) -> bool:
         """Initialize (or re-initialize) the passthrough at the current
-        frame. Allocates / clears the bake. Idempotent — calling Start
-        again replaces the live instance with a fresh one starting at
-        the current frame."""
-        self._passthrough = None
+        frame.
+
+        **Instance reuse** (load-bearing for bake-allocation cost):
+        the existing WorldPassthrough instance is preserved across
+        Start calls. WorldPassthrough.start() then runs against the
+        live instance, and `_allocate_bake` reuses the existing bake
+        buffer if its shape matches the scene's animation length —
+        avoiding a ~1 GB re-allocation on every Stop→Start cycle.
+        A fresh instance is created only on first-ever Start, or
+        after teardown (extension unregister)."""
         try:
             from . import _world_passthrough
         except Exception as exc:
@@ -40,11 +46,14 @@ class SolverInterface:
                   f"'{_world_passthrough.TARGET_NAME}' missing or not Curves")
             return False
 
-        pt = _world_passthrough.WorldPassthrough()
-        if not pt.start(obj, scene):
-            return False
+        # Reuse the existing passthrough instance if present so that
+        # the bake buffer survives Stop → Start cycles. Only create a
+        # new instance on first Start (or after teardown).
+        if self._passthrough is None:
+            self._passthrough = _world_passthrough.WorldPassthrough()
 
-        self._passthrough = pt
+        if not self._passthrough.start(obj, scene):
+            return False
         return True
 
     def teardown(self) -> None:
