@@ -1,4 +1,4 @@
-"""3D View N-panel for the Phase 1 hair simulation skeleton."""
+"""3D View N-panel for the three-mode hair simulation."""
 from __future__ import annotations
 
 import bpy
@@ -6,24 +6,26 @@ from bpy.types import Panel
 
 
 class HAIR_SIM_PT_main(Panel):
-    bl_idname = "HAIR_SIM_PT_main"
-    bl_label = "Hair Simulation"
+    bl_idname     = "HAIR_SIM_PT_main"
+    bl_label      = "Hair Simulation"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "HairSim"
+    bl_category    = "HairSim"
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
-        wm = context.window_manager
+        wm     = context.window_manager
+        mode   = getattr(wm, "hair_sim_mode", "BYPASS")
 
-        status = "Running" if wm.hair_sim_running else "Stopped"
-        layout.label(text=f"Status: {status}")
+        # Mode label.
+        layout.label(text=f"Mode: {mode}")
 
+        # Three buttons. depress=True highlights the active mode so the
+        # user can see at a glance which one is currently selected.
         row = layout.row(align=True)
-        row.operator("hair_sim.start", icon="PLAY")
-        row.operator("hair_sim.stop", icon="PAUSE")
-
-        layout.operator("hair_sim.reset", icon="FILE_REFRESH")
+        row.operator("hair_sim.start",  text="Start",  icon="PLAY",         depress=(mode == "SIMULATING"))
+        row.operator("hair_sim.stop",   text="Stop",   icon="PAUSE",        depress=(mode == "PLAYBACK"))
+        row.operator("hair_sim.bypass", text="Bypass", icon="FILE_REFRESH", depress=(mode == "BYPASS"))
 
 
 _classes = (HAIR_SIM_PT_main,)

@@ -1,25 +1,33 @@
 from __future__ import annotations
 
-import array
-
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty
+from bpy.props import EnumProperty
 from bpy.types import Operator, WindowManager
 
 from . import ui
 
 
-class SolverInterface:
+# Mode values for WindowManager.hair_sim_mode.
+MODE_BYPASS     = "BYPASS"
+MODE_SIMULATING = "SIMULATING"
+MODE_PLAYBACK   = "PLAYBACK"
 
-    _TARGET_OBJECT_NAME = "カーブ.001"
+
+class SolverInterface:
+    """Thin facade between operators / handler and the WorldPassthrough
+    state owner. Holds the single live passthrough instance for the
+    current Blender session."""
 
     def __init__(self) -> None:
         self._passthrough = None
 
     def start(self, scene: bpy.types.Scene) -> bool:
+        """Initialize (or re-initialize) the passthrough at the current
+        frame. Allocates / clears the bake. Idempotent — calling Start
+        again replaces the live instance with a fresh one starting at
+        the current frame."""
         self._passthrough = None
-
         try:
             from . import _world_passthrough
         except Exception as exc:
@@ -39,19 +47,29 @@ class SolverInterface:
         self._passthrough = pt
         return True
 
-    def stop(self) -> None:
+    def teardown(self) -> None:
+        """Full state cleanup. Only called by `unregister()`. Stop and
+        Bypass operators do NOT teardown — they only change mode."""
         if self._passthrough is not None:
-            self._passthrough.stop()
-
-    def reset(self, scene: bpy.types.Scene) -> None:
-        if self._passthrough is None:
-            return
-        self._passthrough.reset(scene)
+            try:
+                self._passthrough.teardown()
+            except Exception:
+                pass
+        self._passthrough = None
 
     def step(self, scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
+        """SIMULATING-mode per-frame entry: scrub-restore from bake, or
+        run one sim step on +1, or re-baseline on jump."""
         if self._passthrough is None:
             return
         self._passthrough.step(scene)
+
+    def playback(self, scene: bpy.types.Scene) -> None:
+        """PLAYBACK-mode per-frame entry: push baked state to Blender if
+        the current frame is baked; otherwise leave Blender alone."""
+        if self._passthrough is None:
+            return
+        self._passthrough.playback(scene)
 
 
 _solver = SolverInterface()
@@ -59,10 +77,20 @@ _solver = SolverInterface()
 
 @persistent
 def _on_frame_change_post(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
+    """Per-frame dispatcher. Branches by `WindowManager.hair_sim_mode`:
+      BYPASS      → return immediately (Blender handles everything).
+      SIMULATING  → call solver.step().
+      PLAYBACK    → call solver.playback()."""
     wm = bpy.context.window_manager
-    if wm is None or not getattr(wm, "hair_sim_running", False):
+    if wm is None:
         return
-    _solver.step(scene, depsgraph)
+    mode = getattr(wm, "hair_sim_mode", MODE_BYPASS)
+    if mode == MODE_BYPASS:
+        return
+    if mode == MODE_SIMULATING:
+        _solver.step(scene, depsgraph)
+    elif mode == MODE_PLAYBACK:
+        _solver.playback(scene)
 
 
 def _install_handler() -> None:
@@ -80,12 +108,14 @@ def _uninstall_handler() -> None:
 class HAIR_SIM_OT_start(Operator):
     bl_idname = "hair_sim.start"
     bl_label = "Start"
-    bl_description = "Begin advancing the hair simulation on frame change"
+    bl_description = (
+        "Enter SIMULATING mode. Initialize the simulator at the current "
+        "frame and allocate the RAM bake. Consecutive +1 frame advances "
+        "run simulation; scrub-back to a baked frame restores from bake"
+    )
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
-        if wm.hair_sim_running:
-            return {"FINISHED"}
 
         from . import _native_loader
         native = _native_loader.get_native()
@@ -102,49 +132,64 @@ class HAIR_SIM_OT_start(Operator):
         if not _solver.start(context.scene):
             self.report({"ERROR"}, "Hair sim start failed (see system console)")
             return {"CANCELLED"}
-        wm.hair_sim_running = True
-        self.report({"INFO"}, "Hair sim running")
+        wm.hair_sim_mode = MODE_SIMULATING
+        self.report({"INFO"}, "Hair sim → SIMULATING")
         return {"FINISHED"}
 
 
 class HAIR_SIM_OT_stop(Operator):
     bl_idname = "hair_sim.stop"
     bl_label = "Stop"
-    bl_description = "Stop advancing the hair simulation on frame change"
+    bl_description = (
+        "Enter PLAYBACK mode. No further simulation runs; on each frame "
+        "change the baked state for that frame is pushed back to "
+        "Blender. State and bake are preserved (Start to resume)"
+    )
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
-        if not wm.hair_sim_running:
-            return {"FINISHED"}
-        _solver.stop()
-        wm.hair_sim_running = False
-        self.report({"INFO"}, "Hair sim stopped")
+        wm.hair_sim_mode = MODE_PLAYBACK
+        # Immediately push current frame's bake (if any) so the viewport
+        # reflects the playback state without waiting for a frame change.
+        _solver.playback(context.scene)
+        self.report({"INFO"}, "Hair sim → PLAYBACK")
         return {"FINISHED"}
 
 
-class HAIR_SIM_OT_reset(Operator):
-    bl_idname = "hair_sim.reset"
-    bl_label = "Reset"
-    bl_description = "Request the solver to reinitialize its internal state"
+class HAIR_SIM_OT_bypass(Operator):
+    bl_idname = "hair_sim.bypass"
+    bl_label = "Bypass"
+    bl_description = (
+        "Enter BYPASS mode. The extension stops intercepting frame "
+        "changes entirely — Blender handles everything natively. State "
+        "and bake are preserved (Start / Stop to resume)"
+    )
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        _solver.reset(context.scene)
+        wm = context.window_manager
+        wm.hair_sim_mode = MODE_BYPASS
+        self.report({"INFO"}, "Hair sim → BYPASS")
         return {"FINISHED"}
 
 
 _classes = (
     HAIR_SIM_OT_start,
     HAIR_SIM_OT_stop,
-    HAIR_SIM_OT_reset,
+    HAIR_SIM_OT_bypass,
 )
 
 
 def register() -> None:
     for cls in _classes:
         bpy.utils.register_class(cls)
-    WindowManager.hair_sim_running = BoolProperty(
-        name="Hair Sim Running",
-        default=False,
+    WindowManager.hair_sim_mode = EnumProperty(
+        name="Hair Sim Mode",
+        items=[
+            (MODE_BYPASS,     "Bypass",     "Extension does nothing — Blender handles all"),
+            (MODE_SIMULATING, "Simulating", "Run sim on consecutive frames; restore from bake on scrub"),
+            (MODE_PLAYBACK,   "Playback",   "Push baked state on every frame; no simulation"),
+        ],
+        default=MODE_BYPASS,
         options={"SKIP_SAVE"},
     )
     ui.register()
@@ -153,11 +198,11 @@ def register() -> None:
 
 def unregister() -> None:
     try:
-        _solver.stop()
+        _solver.teardown()
     except Exception:
         pass
     _uninstall_handler()
     ui.unregister()
-    del WindowManager.hair_sim_running
+    del WindowManager.hair_sim_mode
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

@@ -1,69 +1,73 @@
-"""Hair Simulation — VBD-direction Phase 0: state-evolution scaffolding +
-write-persistence verification test.
+"""Hair Simulation — VBD-direction Phase 0: state-evolution scaffolding
+with RAM bake cache + three-mode lifecycle (Bypass / Simulating / Playback).
 
-This module currently serves TWO purposes:
+**What this module owns**
 
-  (A) Architecture scaffolding for the future VBD solver. The structure
-      (_prev_state held in world coords, _last_frame synced atomically,
-      delta-1 frame dispatch) is the shape any future solver plugs into.
+  * The per-frame state (positions + velocities in world coords) held
+    in `_prev_state`. Single source of truth, updated only by
+    `_capture_current_state`. See "Why" note below.
+  * The full-animation RAM bake: parallel arrays
+    `_bake_positions[n_frames, n_total, 3]` and
+    `_bake_velocities[n_frames, n_total, 3]` plus a per-frame
+    `_bake_mask` boolean. Allocated once at Start (or reused if size
+    matches), sized by the scene's animation length.
+  * The simulation step (currently a deterministic fake deformation
+    for end-to-end verification; replaced by VBD later).
+  * The scrub-restore behaviour: if the user enters a frame that has
+    been baked, the baked state is pushed back to Blender — the
+    simulator never re-derives it.
 
-  (B) Verification of a foundational assumption: when we write to
-      `obj.data.attributes["position"]`, does the write persist through
-      Blender's storage AND the active Geometry Nodes modifier
-      ("サーフェス変形")?
+**What this module does NOT own**
 
-      To answer (B), `_run_one_simulation_step` is wired with a
-      deterministic fake deformation: every step, non-root points
-      receive `world Z += 0.02`. Over N frames the accumulation is
-      observable both in `_prev_state.points_world` and visually.
+  * Mode (Bypass / Simulating / Playback) — lives in
+    `WindowManager.hair_sim_mode`, set by operators.
+  * Which entry point to call per frame — that decision is in the
+    `frame_change_post` handler in `__init__.py`.
 
-      If accumulation occurs → writes persist → the (iii) design
-                                (modifier-output-as-anchor + writeback
-                                to original) is structurally viable.
-      If not                  → strategy needs to be re-thought from
-                                scratch.
+**Three modes (decided by handler)**
 
-**Why _last_frame and _prev_state are always updated together**
+  * SIMULATING → calls `step(scene)`:
+      - If current frame is baked → restore from bake (scrub-back).
+      - Else if current == _last_frame + 1 → run sim, capture, bake.
+      - Else (jump into unbaked area) → re-baseline (capture with
+        zero velocity), do NOT bake.
+
+  * PLAYBACK → calls `playback(scene)`:
+      - If current frame is baked → restore from bake.
+      - Else → do nothing (Blender shows whatever obj.data currently
+        contains; no implicit re-baseline).
+
+  * BYPASS → handler returns early; this module is not called at all.
+
+**Why `_last_frame` and `_prev_state` are always updated together**
 
 Simulation = state evolution. To compute the next state we need the
-previous state. If _last_frame and _prev_state ever fell out of sync,
-the next +1-frame step would solve from stale data, which silently
-produces wrong physics. They are updated atomically in
-`_capture_current_state`.
+previous state. If the two ever drifted apart, the next +1-frame step
+would solve from stale data. They are updated atomically inside
+`_capture_current_state` (and inside `_restore_from_bake`, which is
+also a single-point write).
 
-**Flow**
+**HairFrameState contents**
 
-  on Start (frame N):
-      capture current state  →  _prev_state, _last_frame = N
-      (no simulation runs on Start)
+  points_world      — (n_total, 3) float32, world coords. ALL points
+                       (roots + every joint).
+  velocities_world  — (n_total, 3) float32, world m/sec. Derived only
+                       after a successful +1 simulation step. Zero on
+                       Start / scrub-back / frame-jump.
+  frame             — int, the frame this snapshot corresponds to.
 
-  on every frame_change_post (current frame = M):
-      if M == _last_frame + 1:
-          run one simulation step (fake deformation today)
-          capture current state  →  _prev_state, _last_frame = M
-      else (jump / backward / same):
-          skip simulation
-          capture current state  →  _prev_state, _last_frame = M
-              ★ still update — never carry stale state
-
-  on Stop:
-      clear _prev_state, _last_frame = None
-
-  on Reset:
-      capture current state — re-base on current frame
-
-**Modifier policy (current)**
+**Modifier policy**
 
 The target Curves object carries a Geometry Nodes modifier
-"サーフェス変形". This module does NOT touch it. If verification
-test (B) reveals the modifier overwrites our writeback, the choice
-between (mute modifier) vs (alternative path) is revisited then.
+"サーフェス変形". This module does NOT touch it. Verified
+2026-05-26 (v0.0.27): writes to original `position` persist and
+the Modifier composes its head-tracking offset additively on top.
 
 **Phase 1 invariants preserved**
 
 Exactly one persistent `frame_change_post` handler, gated by
-`WindowManager.hair_sim_running`. step() is invoked at most once per
-frame change.
+`WindowManager.hair_sim_mode != "BYPASS"`. step() / playback() are
+invoked at most once per frame change.
 """
 from __future__ import annotations
 
@@ -76,25 +80,24 @@ import numpy as np
 TARGET_NAME        = "カーブ.001"
 POINTS_PER_STRAND  = 8       # Uniform per Phase 3A scene investigation.
 TEST_Z_PER_STEP    = 0.02    # World-Z increment applied to non-root points
-                             # each simulation step. (B) verification only.
+                             # each simulation step. Verification placeholder
+                             # until real VBD lands.
 
 
 @dataclass
 class HairFrameState:
     """One frame's hair snapshot. All world coordinates. Sufficient to
-    reproduce hair shape and to drive the next-frame state transition.
-
-    Today only positions are held. Velocities, per-strand attributes,
-    and other dynamics-related fields will be added when the real
-    solver lands; the dataclass shape is intended to grow."""
-    points_world: np.ndarray   # (n_total, 3) float32
-    frame:        int
+    reproduce hair shape AND to drive next-frame physics."""
+    points_world:     np.ndarray   # (n_total, 3) float32 — world coords
+    velocities_world: np.ndarray   # (n_total, 3) float32 — world m/sec
+    frame:            int
 
 
 class WorldPassthrough:
-    """Stateful manager of the state-evolution scaffolding. One instance
-    is created on Start, lives for the running session, and is torn
-    down on Stop / Reset → Start cycles."""
+    """Stateful manager of the state-evolution scaffolding + RAM bake.
+    One instance is created on Start, lives across mode changes
+    (Stop/Bypass do not tear it down), and is freed via teardown() on
+    extension unregister."""
 
     def __init__(self) -> None:
         self._initialized       = False
@@ -108,16 +111,128 @@ class WorldPassthrough:
         self._last_frame        = None  # type: int | None
         self._prev_state        = None  # type: HairFrameState | None
 
+        # RAM bake cache (allocated at Start, sized by scene anim length).
+        self._bake_positions    = None  # type: np.ndarray | None  shape (n_frames, n_total, 3)
+        self._bake_velocities   = None  # type: np.ndarray | None  shape (n_frames, n_total, 3)
+        self._bake_mask         = None  # type: np.ndarray | None  shape (n_frames,) bool
+        self._bake_frame_start  = None  # type: int | None
+        self._bake_frame_end    = None  # type: int | None
+
         # Per-call telemetry.
         self._step_count        = 0
 
-    # ---- placeholder hooks — to be filled in later phases ----
+    # ----------------------------------------------------------- #
+    # Bake helpers
+    # ----------------------------------------------------------- #
 
-    def _capture_current_state(self, scene: bpy.types.Scene) -> None:
-        """Snapshot the current frame's full hair state (all point
-        world positions) so the next simulation step has a 'previous
-        state' to evolve from. `_last_frame` and `_prev_state` are
-        updated atomically."""
+    def _allocate_bake(self, scene: bpy.types.Scene) -> None:
+        """Allocate (or resize) the RAM bake to fit the scene's animation
+        length. Reuses existing arrays if shape matches; in either case
+        the per-frame `_bake_mask` is cleared so no frame is considered
+        baked at the start of a new Start session."""
+        fs = int(scene.frame_start)
+        fe = int(scene.frame_end)
+        if fe < fs:
+            fe = fs
+        n_frames = fe - fs + 1
+        n_total  = self._n_total
+
+        desired_shape = (n_frames, n_total, 3)
+        need_realloc = (
+            self._bake_positions is None
+            or self._bake_positions.shape != desired_shape
+        )
+        if need_realloc:
+            # Costly: ~0.5–1 GB on full-length animations. One-shot per
+            # session (cf. user spec: "1回だけ初期化").
+            self._bake_positions  = np.zeros(desired_shape, dtype=np.float32)
+            self._bake_velocities = np.zeros(desired_shape, dtype=np.float32)
+            self._bake_mask       = np.zeros(n_frames,      dtype=bool)
+        else:
+            self._bake_mask[:] = False
+
+        self._bake_frame_start = fs
+        self._bake_frame_end   = fe
+
+    def _frame_to_bake_index(self, frame: int) -> int | None:
+        """Map a Blender frame number to its bake-array index. Returns
+        None if the frame is outside the allocated bake range."""
+        if self._bake_frame_start is None or self._bake_frame_end is None:
+            return None
+        if frame < self._bake_frame_start or frame > self._bake_frame_end:
+            return None
+        return frame - self._bake_frame_start
+
+    def _store_prev_state_to_bake(self) -> bool:
+        """Write the current `_prev_state` into `_bake_*[index]` and
+        flag the frame as baked. No-op (returns False) if `_prev_state`
+        is None or its frame is outside the bake range."""
+        if self._prev_state is None:
+            return False
+        idx = self._frame_to_bake_index(self._prev_state.frame)
+        if idx is None:
+            return False
+        self._bake_positions [idx] = self._prev_state.points_world
+        self._bake_velocities[idx] = self._prev_state.velocities_world
+        self._bake_mask      [idx] = True
+        return True
+
+    def _restore_from_bake(self, frame: int) -> bool:
+        """Push the baked state at `frame` to Blender's ORIGINAL Curves,
+        and update `_prev_state` / `_last_frame` to match. Returns False
+        if the frame is outside the bake range or not baked yet."""
+        idx = self._frame_to_bake_index(frame)
+        if idx is None or not self._bake_mask[idx]:
+            return False
+        obj = bpy.data.objects.get(self._target_obj_name)
+        if obj is None:
+            return False
+        attr = obj.data.attributes.get("position")
+        if attr is None or len(attr.data) != self._n_total:
+            return False
+
+        n          = self._n_total
+        world_pts  = self._bake_positions [idx]
+        velocities = self._bake_velocities[idx]
+
+        # Convert world → local via matrix_world.inverted() and write.
+        mw_inv  = np.array(obj.matrix_world.inverted(), dtype=np.float32)
+        world_h = np.column_stack([world_pts, np.ones(n, dtype=np.float32)])
+        local_h = world_h @ mw_inv.T
+        local_pts = local_h[:, :3].astype(np.float32, copy=True)
+
+        attr.data.foreach_set("vector", local_pts.flatten().tolist())
+        obj.data.update_tag()
+
+        # Sync the per-frame state holder so future +1 steps work.
+        self._prev_state = HairFrameState(
+            points_world     = world_pts.copy(),
+            velocities_world = velocities.copy(),
+            frame            = frame,
+        )
+        self._last_frame = frame
+        return True
+
+    # ----------------------------------------------------------- #
+    # State capture (single source of truth for _prev_state writes)
+    # ----------------------------------------------------------- #
+
+    def _capture_current_state(
+        self,
+        scene: bpy.types.Scene,
+        derive_velocity_from_prev: bool = False,
+    ) -> None:
+        """Snapshot the current frame's full hair state (positions +
+        velocities, world coords). `_last_frame` and `_prev_state` are
+        updated atomically.
+
+        Velocity policy:
+          derive_velocity_from_prev=True  → velocity = (new - prev) / dt
+            Called only after a successful +1 simulation step.
+          derive_velocity_from_prev=False → velocity = zeros
+            Start, frame-jump, and any re-baselining event."""
+        prior = self._prev_state
+
         frame = scene.frame_current
         self._last_frame = frame
 
@@ -143,24 +258,40 @@ class WorldPassthrough:
         world_h = local_h @ mw.T
         world_pts = world_h[:, :3].astype(np.float32, copy=True)
 
+        # 3. Derive velocities (or zero them on re-baselining events).
+        if (
+            derive_velocity_from_prev
+            and prior is not None
+            and prior.points_world.shape == world_pts.shape
+        ):
+            dt = float(scene.render.fps_base) / float(scene.render.fps)
+            velocities_world = ((world_pts - prior.points_world) / dt).astype(
+                np.float32, copy=False
+            )
+        else:
+            velocities_world = np.zeros_like(world_pts)
+
         self._prev_state = HairFrameState(
-            points_world=world_pts,
-            frame=frame,
+            points_world     = world_pts,
+            velocities_world = velocities_world,
+            frame            = frame,
         )
+
+    # ----------------------------------------------------------- #
+    # Simulation (placeholder — real VBD lands here)
+    # ----------------------------------------------------------- #
 
     def _run_one_simulation_step(self, scene: bpy.types.Scene) -> None:
         """Evolve state by exactly one frame.
 
-        **Today (verification test (B))**: deterministic fake
-        deformation. Non-root points receive `world Z += TEST_Z_PER_STEP`
-        each call. Roots are not touched. Over N invocations the
-        accumulation is observable both in `_prev_state.points_world`
-        and in the viewport.
+        **Placeholder today**: deterministic fake deformation. Non-root
+        points receive `world Z += TEST_Z_PER_STEP` each call. This is
+        the end-to-end smoke test that the (iii) writeback design
+        actually drives Blender; it stays until VBD replaces it.
 
-        The real VBD solver lands here later, replacing the fake
-        deformation while preserving the input/output contract:
-        (_prev_state + Blender's current boundary) → new state →
-        write back to ORIGINAL."""
+        The real VBD solver lands here later, preserving the contract:
+        `(_prev_state + Blender's current boundary) → new state → write
+        back to ORIGINAL`."""
         if self._prev_state is None:
             return
         obj = bpy.data.objects.get(self._target_obj_name)
@@ -173,7 +304,6 @@ class WorldPassthrough:
         world_pts = self._prev_state.points_world.copy()
 
         # 2. Apply fake deformation in world space.
-        #    Non-root points (index within strand != 0) shift up in Z.
         is_non_root = (np.arange(n) % POINTS_PER_STRAND) != 0
         world_pts[is_non_root, 2] += TEST_Z_PER_STEP
 
@@ -190,12 +320,15 @@ class WorldPassthrough:
         attr.data.foreach_set("vector", local_pts.flatten().tolist())
         obj.data.update_tag()
 
-    # ---- lifecycle ----
+    # ----------------------------------------------------------- #
+    # Lifecycle
+    # ----------------------------------------------------------- #
 
     def start(self, obj, scene: bpy.types.Scene) -> bool:
-        """Acquire the target Curves and capture the current frame as
-        the simulation's initial state. Returns False on any geometry
-        sanity failure; caller must keep `hair_sim_running=False`."""
+        """Initialize / re-initialize the simulator at the current
+        frame. Allocates (or resizes / clears) the RAM bake, captures
+        the current frame as the initial state, and stores it in the
+        bake. Returns False on geometry sanity failure."""
         self._step_error_active = False
         self._initialized       = False
         self._last_frame        = None
@@ -225,76 +358,129 @@ class WorldPassthrough:
         self._step_count      = 0
         self._initialized     = True
 
-        # Capture initial state at the Start frame.
-        self._capture_current_state(scene)
+        # Allocate (or reuse) the RAM bake. Clears mask either way.
+        self._allocate_bake(scene)
 
+        # Capture and bake the initial frame.
+        self._capture_current_state(scene, derive_velocity_from_prev=False)
+        self._store_prev_state_to_bake()
+
+        n_frames = self._bake_frame_end - self._bake_frame_start + 1
+        bake_mb = self._bake_positions.nbytes / (1024 * 1024) if self._bake_positions is not None else 0
         print(
             "[hair_sim/passthrough] start ok: "
             f"target={obj.name!r}, n_total={n_total}, "
             f"start_frame={self._last_frame}, "
-            f"prev_state_set={self._prev_state is not None}"
+            f"bake_range=[{self._bake_frame_start}..{self._bake_frame_end}] "
+            f"(n_frames={n_frames}, ~{bake_mb:.1f} MB × 2 buffers)"
         )
         return True
 
-    def stop(self) -> None:
-        """Clear simulation state. Modifier is NOT touched (current policy)."""
-        self._last_frame = None
-        self._prev_state = None
-
-    def reset(self, scene: bpy.types.Scene) -> bool:
-        """Re-base the simulation on the current frame, as if Start
-        were pressed again at this frame. Required before resuming
-        simulation from an unrelated frame position."""
-        if not self._initialized:
-            return False
+    def teardown(self) -> None:
+        """Free all per-session state. Called by extension `unregister()`.
+        Operator Stop / Bypass do NOT teardown — they only change mode."""
+        self._last_frame        = None
+        self._prev_state        = None
+        self._bake_positions    = None
+        self._bake_velocities   = None
+        self._bake_mask         = None
+        self._bake_frame_start  = None
+        self._bake_frame_end    = None
+        self._initialized       = False
         self._step_error_active = False
-        self._step_count        = 0
-        self._capture_current_state(scene)
-        return True
 
-    # ---- per-frame entry from handler ----
+    # ----------------------------------------------------------- #
+    # Per-frame entries from the handler (mode dispatch in __init__.py)
+    # ----------------------------------------------------------- #
 
     def step(self, scene: bpy.types.Scene) -> bool:
-        """Dispatch by frame delta:
-          M == last+1 → run one simulation step + capture
-          else        → skip simulation + capture (still re-base)
-        Both branches keep `_last_frame` and `_prev_state` in sync."""
+        """SIMULATING-mode per-frame entry.
+
+        Priority:
+          1. If current frame is baked → restore from bake (scrub-back).
+          2. Else if M == last+1 → run sim step, capture, bake.
+          3. Else (jump into unbaked area) → re-baseline only (no sim,
+             no bake — this is a teleport, not a physical motion)."""
         if self._step_error_active or not self._initialized:
             return False
         if self._last_frame is None:
-            # Defensive: Start should have set this.
             return False
 
-        current = scene.frame_current
+        M = scene.frame_current
+        idx = self._frame_to_bake_index(M)
+
         try:
-            if current == self._last_frame + 1:
+            # 1. Scrub-restore: already baked → push and exit.
+            if idx is not None and self._bake_mask[idx]:
+                self._restore_from_bake(M)
+                return True
+
+            # 2. Consecutive +1 frame, not yet baked → simulate.
+            if M == self._last_frame + 1:
                 self._run_one_simulation_step(scene)
-                self._capture_current_state(scene)
+                self._capture_current_state(scene, derive_velocity_from_prev=True)
+                self._store_prev_state_to_bake()
                 self._step_count += 1
-            else:
-                # Frame jumped / went backward / stayed same → cannot
-                # simulate. Re-capture so stale state is never held.
-                self._capture_current_state(scene)
+                return True
+
+            # 3. Jump into unbaked territory → re-baseline.
+            self._capture_current_state(scene, derive_velocity_from_prev=False)
+            # Intentionally NOT bake-stored: not a sim result.
+            return True
         except Exception as exc:
             self._step_error_active = True
             print(f"[hair_sim/passthrough] step error (suppressing): {exc!r}")
             return False
-        return True
 
-    # ---- introspection ----
+    def playback(self, scene: bpy.types.Scene) -> bool:
+        """PLAYBACK-mode per-frame entry. Push baked state to Blender if
+        the current frame is baked; do nothing otherwise. Never runs
+        simulation."""
+        if not self._initialized:
+            return False
+        M = scene.frame_current
+        idx = self._frame_to_bake_index(M)
+        if idx is None or not self._bake_mask[idx]:
+            # Unbaked frame in PLAYBACK: leave Blender alone.
+            return False
+        try:
+            self._restore_from_bake(M)
+            return True
+        except Exception as exc:
+            print(f"[hair_sim/passthrough] playback error (suppressing): {exc!r}")
+            return False
+
+    # ----------------------------------------------------------- #
+    # Introspection
+    # ----------------------------------------------------------- #
 
     def status(self) -> dict:
         prev_summary = None
         if self._prev_state is not None:
             pts = self._prev_state.points_world
-            # Sample point 0 (a root) and point 7 (a tip in strand 0).
+            vel = self._prev_state.velocities_world
+            non_root_mask = (np.arange(pts.shape[0]) % POINTS_PER_STRAND) != 0
             prev_summary = {
-                "frame":            self._prev_state.frame,
-                "shape":            list(pts.shape),
-                "root0_world_xyz":  [float(x) for x in pts[0]],
-                "tip0_world_xyz":   [float(x) for x in pts[POINTS_PER_STRAND - 1]],
-                "z_mean_non_root":  float(pts[(np.arange(pts.shape[0]) % POINTS_PER_STRAND) != 0, 2].mean()),
-                "z_mean_root":      float(pts[0::POINTS_PER_STRAND, 2].mean()),
+                "frame":                 self._prev_state.frame,
+                "points_shape":          list(pts.shape),
+                "velocities_shape":      list(vel.shape),
+                "root0_world_xyz":       [float(x) for x in pts[0]],
+                "tip0_world_xyz":        [float(x) for x in pts[POINTS_PER_STRAND - 1]],
+                "z_mean_non_root":       float(pts[non_root_mask, 2].mean()),
+                "z_mean_root":           float(pts[0::POINTS_PER_STRAND, 2].mean()),
+                "vel_max_abs":           float(np.abs(vel).max()),
+                "vel_mean_mag_non_root": float(np.linalg.norm(vel[non_root_mask], axis=1).mean()),
+                "vel_mean_mag_root":     float(np.linalg.norm(vel[0::POINTS_PER_STRAND], axis=1).mean()),
+            }
+        bake_summary = None
+        if self._bake_mask is not None:
+            bake_summary = {
+                "frame_range":      [self._bake_frame_start, self._bake_frame_end],
+                "n_frames":         int(self._bake_mask.shape[0]),
+                "n_baked":          int(self._bake_mask.sum()),
+                "buffer_mb_each":   round(
+                    self._bake_positions.nbytes / (1024 * 1024), 2
+                ) if self._bake_positions is not None else None,
             }
         return {
             "initialized":       self._initialized,
@@ -304,4 +490,5 @@ class WorldPassthrough:
             "last_frame":        self._last_frame,
             "step_count":        self._step_count,
             "prev_state":        prev_summary,
+            "bake":              bake_summary,
         }
