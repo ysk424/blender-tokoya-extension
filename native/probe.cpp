@@ -1,4 +1,4 @@
-// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G placeholder module. Module name,
+// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H placeholder module. Module name,
 // function names, and phase attribute are experimental and will
 // change before any real solver wiring.
 //
@@ -34,6 +34,11 @@
 //                                  A — completely separated globals from
 //                                  the CPU path; mutually exclusive open;
 //                                  empty scene only — no rigid bodies)
+//   5H: physx_benchmark_rigid_grid_cpu / _gpu
+//                                 (CPU vs GPU rigid-body grid benchmark
+//                                  on a ground plane; sphere grid; local
+//                                  PhysX per call; no global pollution;
+//                                  GPU rejects fallback as failure)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
@@ -41,6 +46,7 @@
 #include <cudamanager/PxCudaContextManager.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <exception>
 #include <string>
@@ -1573,6 +1579,319 @@ py::dict physx_gpu_probe_close()
     return d;
 }
 
+// ---------------------------------------------------------------------- //
+// Phase 5H: CPU vs GPU rigid-body grid benchmark
+//
+// Each call builds a completely local PhysX stack (foundation through
+// scene), populates a cube-ish grid of dynamic spheres above a static
+// ground plane, simulates step_count frames, and tears everything down.
+// No global probe state is touched, so a benchmark call cannot leak into
+// or out of the CPU/GPU probe lifecycles. If either probe is already
+// open the benchmark is rejected.
+//
+// Restitution is set to 0 so spheres settle predictably and benchmark
+// noise from bouncing is reduced.
+// ---------------------------------------------------------------------- //
+
+namespace {
+
+py::dict run_rigid_grid_benchmark(
+    bool         use_gpu,
+    unsigned int actor_count,
+    unsigned int step_count,
+    float        dt,
+    float        sphere_radius,
+    float        sphere_density,
+    float        grid_spacing,
+    float        grid_origin_y)
+{
+    using clock = std::chrono::high_resolution_clock;
+
+    py::dict d;
+    d["mode"]              = std::string(use_gpu ? "GPU" : "CPU");
+    d["actor_count"]       = actor_count;
+    d["step_count"]        = step_count;
+    d["dt"]                = dt;
+    d["shape_type"]        = std::string("sphere");
+    d["radius"]            = sphere_radius;
+    d["density"]           = sphere_density;
+    d["grid_spacing"]      = grid_spacing;
+    d["grid_origin_y"]     = grid_origin_y;
+    d["fallback_detected"] = false;
+    d["warmup_step_time_ms"] = 0.0;
+
+    // Cross-rejection vs existing probe lifecycles.
+    if (g_foundation != nullptr || g_gpu_foundation != nullptr) {
+        d["accepted"] = false;
+        d["message"]  = "rejected: a CPU or GPU probe context is open; close it first";
+        return d;
+    }
+
+    if (actor_count == 0u || step_count == 0u
+        || !(dt > 0.0f) || !(sphere_radius > 0.0f)
+        || !(sphere_density > 0.0f) || !(grid_spacing > 0.0f)) {
+        d["accepted"] = false;
+        d["message"]  = "rejected: actor_count/step_count > 0; dt/radius/density/spacing > 0 required";
+        return d;
+    }
+
+    // ---- Foundation ----
+    const auto t_scene_t0 = clock::now();
+    PxFoundation* fnd = PxCreateFoundation(PX_PHYSICS_VERSION, g_allocator, g_error_callback);
+    if (fnd == nullptr) {
+        d["accepted"] = false;
+        d["message"]  = "PxCreateFoundation failed";
+        return d;
+    }
+
+    // ---- CUDA context (GPU only) ----
+    PxCudaContextManager* cuda_ctx = nullptr;
+    std::string cuda_dev_name;
+    if (use_gpu) {
+        PxCudaContextManagerDesc cudaDesc;
+        cuda_ctx = PxCreateCudaContextManager(*fnd, cudaDesc);
+        if (cuda_ctx == nullptr || !cuda_ctx->contextIsValid()) {
+            if (cuda_ctx != nullptr) cuda_ctx->release();
+            fnd->release();
+            d["accepted"]              = false;
+            d["fallback_detected"]     = true;
+            d["cuda_context_created"]  = false;
+            d["message"]               = "GPU init failed (PxCreateCudaContextManager null or invalid)";
+            return d;
+        }
+        const char* nm = cuda_ctx->getDeviceName();
+        cuda_dev_name = (nm != nullptr) ? nm : "(unknown)";
+        d["cuda_context_created"] = true;
+        d["cuda_device_name"]     = cuda_dev_name;
+        d["cuda_device_count"]    = 1;
+    }
+
+    // ---- Physics ----
+    PxPhysics* phy = PxCreatePhysics(PX_PHYSICS_VERSION, *fnd, PxTolerancesScale(), false, nullptr);
+    if (phy == nullptr) {
+        if (cuda_ctx != nullptr) cuda_ctx->release();
+        fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "PxCreatePhysics failed";
+        return d;
+    }
+
+    // ---- Dispatcher ----
+    PxDefaultCpuDispatcher* disp = PxDefaultCpuDispatcherCreate(2);
+    if (disp == nullptr) {
+        phy->release();
+        if (cuda_ctx != nullptr) cuda_ctx->release();
+        fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "PxDefaultCpuDispatcherCreate failed";
+        return d;
+    }
+
+    // ---- Scene ----
+    PxSceneDesc sd(phy->getTolerancesScale());
+    sd.gravity       = PxVec3(0.0f, -9.81f, 0.0f);
+    sd.cpuDispatcher = disp;
+    sd.filterShader  = PxDefaultSimulationFilterShader;
+    if (use_gpu) {
+        sd.cudaContextManager = cuda_ctx;
+        sd.flags             |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
+        sd.broadPhaseType     = PxBroadPhaseType::eGPU;
+    }
+
+    PxScene* sc = phy->createScene(sd);
+    if (sc == nullptr) {
+        disp->release();
+        phy->release();
+        if (cuda_ctx != nullptr) cuda_ctx->release();
+        fnd->release();
+        d["accepted"]          = false;
+        d["fallback_detected"] = use_gpu;
+        d["message"]           = "createScene failed";
+        return d;
+    }
+
+    // GPU fallback verification (do NOT accept silent fallback as success).
+    if (use_gpu) {
+        const PxSceneFlags actualFlags = sc->getFlags();
+        const bool gpu_dyn = bool(actualFlags & PxSceneFlag::eENABLE_GPU_DYNAMICS);
+        const PxBroadPhaseType::Enum bp = sc->getBroadPhaseType();
+        d["gpu_dynamics_enabled"]   = gpu_dyn;
+        d["broadphase_type"]        = broadphase_type_name(bp);
+        d["gpu_broadphase_enabled"] = (bp == PxBroadPhaseType::eGPU);
+        if (!gpu_dyn || bp != PxBroadPhaseType::eGPU) {
+            sc->release();
+            disp->release();
+            phy->release();
+            cuda_ctx->release();
+            fnd->release();
+            d["accepted"]          = false;
+            d["fallback_detected"] = true;
+            d["message"]           = "GPU scene silently fell back to CPU; rejecting as failed GPU benchmark";
+            return d;
+        }
+    }
+
+    // ---- Material + ground plane ----
+    // restitution = 0 keeps the benchmark predictable (no bouncing tail).
+    PxMaterial* mat = phy->createMaterial(0.5f, 0.5f, 0.0f);
+    PxRigidStatic* ground = PxCreatePlane(*phy, PxPlane(0.0f, 1.0f, 0.0f, 0.0f), *mat);
+    sc->addActor(*ground);
+
+    const auto t_scene_t1 = clock::now();
+    d["scene_create_time_ms"] = std::chrono::duration<double, std::milli>(t_scene_t1 - t_scene_t0).count();
+
+    // ---- Build sphere grid (cube-ish layout) ----
+    const auto t_act_t0 = clock::now();
+    const unsigned int side =
+        static_cast<unsigned int>(std::ceil(std::cbrt(static_cast<double>(actor_count))));
+    std::vector<PxRigidDynamic*> actors;
+    actors.reserve(actor_count);
+
+    for (unsigned int iy = 0; iy < side && actors.size() < actor_count; ++iy) {
+        for (unsigned int ix = 0; ix < side && actors.size() < actor_count; ++ix) {
+            for (unsigned int iz = 0; iz < side && actors.size() < actor_count; ++iz) {
+                const float x = (static_cast<float>(ix) - static_cast<float>(side) * 0.5f + 0.5f) * grid_spacing;
+                const float z = (static_cast<float>(iz) - static_cast<float>(side) * 0.5f + 0.5f) * grid_spacing;
+                const float y = grid_origin_y + static_cast<float>(iy) * grid_spacing;
+
+                PxRigidDynamic* a = PxCreateDynamic(
+                    *phy, PxTransform(PxVec3(x, y, z)),
+                    PxSphereGeometry(sphere_radius), *mat, sphere_density);
+                if (a == nullptr) continue;
+                a->setLinearDamping(0.0f);
+                a->setAngularDamping(0.0f);
+                sc->addActor(*a);
+                actors.push_back(a);
+            }
+        }
+    }
+    const auto t_act_t1 = clock::now();
+    d["actor_create_time_ms"]   = std::chrono::duration<double, std::milli>(t_act_t1 - t_act_t0).count();
+    d["actor_count_created"]    = static_cast<unsigned int>(actors.size());
+    d["grid_side"]              = side;
+
+    if (actors.empty()) {
+        ground->release();
+        mat->release();
+        sc->release();
+        disp->release();
+        phy->release();
+        if (cuda_ctx != nullptr) cuda_ctx->release();
+        fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "no actors could be created";
+        return d;
+    }
+
+    // ---- Capture initial pose / checksum ----
+    const PxVec3 first_init = actors[0]->getGlobalPose().p;
+    const PxVec3 last_init  = actors[actors.size() - 1u]->getGlobalPose().p;
+    double cs_init = 0.0;
+    for (PxRigidDynamic* a : actors) {
+        const PxVec3 p = a->getGlobalPose().p;
+        cs_init += static_cast<double>(p.x) + static_cast<double>(p.y) + static_cast<double>(p.z);
+    }
+
+    // ---- Warm-up (GPU only) — reported but not folded into timed total ----
+    if (use_gpu) {
+        const auto wt0 = clock::now();
+        try {
+            sc->simulate(dt);
+            sc->fetchResults(true);
+        } catch (...) { /* surfaces in main loop too */ }
+        const auto wt1 = clock::now();
+        d["warmup_step_time_ms"] =
+            std::chrono::duration<double, std::milli>(wt1 - wt0).count();
+    }
+
+    // ---- Timed steps ----
+    double total_ns = 0.0;
+    double min_ns   = 1e30;
+    double max_ns   = 0.0;
+    std::string step_err;
+    try {
+        for (unsigned int s = 0; s < step_count; ++s) {
+            const auto st0 = clock::now();
+            sc->simulate(dt);
+            sc->fetchResults(true);
+            const auto st1 = clock::now();
+            const double dn = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(st1 - st0).count());
+            total_ns += dn;
+            if (dn < min_ns) min_ns = dn;
+            if (dn > max_ns) max_ns = dn;
+        }
+    } catch (const std::exception& e) {
+        step_err = std::string("simulate/fetch exception: ") + e.what();
+    } catch (...) {
+        step_err = "simulate/fetch unknown exception";
+    }
+    d["total_simulation_time_ms"] = total_ns / 1.0e6;
+    d["average_step_time_ms"]     = (step_count > 0u) ? ((total_ns / static_cast<double>(step_count)) / 1.0e6) : 0.0;
+    d["min_step_time_ms"]         = (min_ns < 1e30) ? (min_ns / 1.0e6) : 0.0;
+    d["max_step_time_ms"]         = max_ns / 1.0e6;
+
+    // ---- Capture final pose / checksum / NaN-Inf scan ----
+    const PxVec3 first_final = actors[0]->getGlobalPose().p;
+    const PxVec3 last_final  = actors[actors.size() - 1u]->getGlobalPose().p;
+    double cs_final = 0.0;
+    int nan_inf_count = 0;
+    for (PxRigidDynamic* a : actors) {
+        const PxVec3 p = a->getGlobalPose().p;
+        cs_final += static_cast<double>(p.x) + static_cast<double>(p.y) + static_cast<double>(p.z);
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            nan_inf_count++;
+        }
+    }
+    d["first_actor_initial_position"] = py::make_tuple(first_init.x, first_init.y, first_init.z);
+    d["first_actor_final_position"]   = py::make_tuple(first_final.x, first_final.y, first_final.z);
+    d["last_actor_initial_position"]  = py::make_tuple(last_init.x,  last_init.y,  last_init.z);
+    d["last_actor_final_position"]    = py::make_tuple(last_final.x, last_final.y, last_final.z);
+    d["checksum_initial_positions"]   = cs_init;
+    d["checksum_final_positions"]     = cs_final;
+    d["nan_inf_count"]                = nan_inf_count;
+    d["finite_check"]                 = (nan_inf_count == 0);
+
+    // ---- Cleanup (reverse order) ----
+    for (PxRigidDynamic* a : actors) a->release();
+    actors.clear();
+    ground->release();
+    mat->release();
+    sc->release();
+    disp->release();
+    phy->release();
+    if (cuda_ctx != nullptr) cuda_ctx->release();
+    fnd->release();
+
+    d["accepted"] = step_err.empty();
+    d["message"]  = step_err.empty()
+        ? std::string(use_gpu ? "GPU" : "CPU") + " benchmark completed"
+        : step_err;
+    return d;
+}
+
+}  // anonymous namespace
+
+py::dict physx_benchmark_rigid_grid_cpu(
+    unsigned int actor_count, unsigned int step_count, float dt,
+    float sphere_radius, float sphere_density,
+    float grid_spacing, float grid_origin_y)
+{
+    return run_rigid_grid_benchmark(/*use_gpu=*/false,
+        actor_count, step_count, dt,
+        sphere_radius, sphere_density, grid_spacing, grid_origin_y);
+}
+
+py::dict physx_benchmark_rigid_grid_gpu(
+    unsigned int actor_count, unsigned int step_count, float dt,
+    float sphere_radius, float sphere_density,
+    float grid_spacing, float grid_origin_y)
+{
+    return run_rigid_grid_benchmark(/*use_gpu=*/true,
+        actor_count, step_count, dt,
+        sphere_radius, sphere_density, grid_spacing, grid_origin_y);
+}
+
 PYBIND11_MODULE(phase2b_probe, m) {
     m.attr("phase") = "2B";
     m.def("add", &add);
@@ -1627,4 +1946,22 @@ PYBIND11_MODULE(phase2b_probe, m) {
     m.def("physx_gpu_probe_step",   &physx_gpu_probe_step,
           py::arg("dt"));
     m.def("physx_gpu_probe_close",  &physx_gpu_probe_close);
+
+    // Phase 5H: CPU vs GPU rigid-grid benchmark (self-contained per call).
+    m.def("physx_benchmark_rigid_grid_cpu", &physx_benchmark_rigid_grid_cpu,
+          py::arg("actor_count"),
+          py::arg("step_count")    = 120u,
+          py::arg("dt")            = 1.0f / 60.0f,
+          py::arg("sphere_radius") = 0.05f,
+          py::arg("sphere_density")= 1.0f,
+          py::arg("grid_spacing")  = 0.2f,
+          py::arg("grid_origin_y") = 1.0f);
+    m.def("physx_benchmark_rigid_grid_gpu", &physx_benchmark_rigid_grid_gpu,
+          py::arg("actor_count"),
+          py::arg("step_count")    = 120u,
+          py::arg("dt")            = 1.0f / 60.0f,
+          py::arg("sphere_radius") = 0.05f,
+          py::arg("sphere_density")= 1.0f,
+          py::arg("grid_spacing")  = 0.2f,
+          py::arg("grid_origin_y") = 1.0f);
 }

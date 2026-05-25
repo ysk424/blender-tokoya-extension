@@ -79,7 +79,8 @@ expand scope or merge phases without explicit approval.**
 | **4E** | Time-driven non-cumulative C++ deformation across frames 800–840 via temporary `frame_change_post` handler. C++ replaces Phase 3E's pure Python loop: handler-internal cost **0.24 ms** (vs 12 ms in 3E, ~50× faster). 1-frame end-to-end stays at ~100 ms because Blender-side depsgraph/Surface Deform/rig dominates. Determinism, baseline restore, handler cleanup, Phase 1 invariants all verified | (MCP only) |
 | **5A** | PhysX 5.6.1 lifecycle probe: `physx_probe_open / status / close` in `native/probe.cpp`. CPU only (no GPU, no CUDA, no simulation, no rigid bodies). PhysX SDK cloned to **`C:\Users\azoo\git\PhysX`** (sibling dir, not in this repo), built with custom preset `vc17win64-cpu-md` (CPU only + dynamic CRT `/MD` to match pybind11). Open → status → close round-trips, idempotent re-open/re-close, Blender never crashes. First crash on 0.0.8 (`PhysX_64.dll` delay-loads `PhysXCommon_64.dll`, which `os.add_dll_directory` does NOT cover) → fixed in 0.0.9 by preloading the 3 PhysX DLLs in dependency order via `ctypes.WinDLL` inside `_native_loader.py` | this commit |
 | **5F** | MCP-only practical-scale verification of the Phase 5E pipeline against **CC_Base_Body** (225,184 verts / 397,024 loop triangles, Blender `Armature` modifier). Same Blender (x,y,z) → PhysX (x,z,-y) axis remap as 5E. Buffer build (matrix_world + remap + index extraction) via numpy fast path = **71.8 ms**. PhysX **CPU cooking = 130.1 ms** for 397k triangles. Per-step simulation = **0.081 ms/step** (dominated by BVH traversal). Sphere bounced at step 28 (meaningful interaction confirmed), then exited the body footprint as in 5E. Two cycles bit-deterministic. Blender did not crash. GPU/CUDA unused, Curves/SolverInterface untouched. **No code changes** | (MCP only — see Phase 5E commit `0ee4918`) |
-| **5G** | **GPU / CUDA PhysX lifecycle opened.** Custom preset `vc17win64-gpu-md` (CUDA 12.9, `/MD`, `PX_GENERATE_GPU_PROJECTS=True`, `PX_GENERATE_GPU_REDUCED_ARCHITECTURES=True` → SASS 80/86/89/90/100/120 + PTX 120, Blackwell SM_120 covered) built `PhysXGpu_64.dll` (324 MB). New entry points `physx_gpu_probe_open / status / step / close` in `native/probe.cpp` — **case A: completely separate GPU globals** from the CPU path, mutually exclusive open. `PxCreateCudaContextManager` succeeded, `cuda_device_name = "NVIDIA GeForce RTX 5070 Ti"`, `broadphase_type="GPU"`, `gpu_dynamics_enabled=true`, **`fallback_detected=false`**. Empty-scene `simulate/fetchResults` succeeded across 2 cycles. CPU path regression-free. Blender did not crash | this commit |
+| **5G** | **GPU / CUDA PhysX lifecycle opened.** Custom preset `vc17win64-gpu-md` (CUDA 12.9, `/MD`, `PX_GENERATE_GPU_PROJECTS=True`, `PX_GENERATE_GPU_REDUCED_ARCHITECTURES=True` → SASS 80/86/89/90/100/120 + PTX 120, Blackwell SM_120 covered) built `PhysXGpu_64.dll` (324 MB). New entry points `physx_gpu_probe_open / status / step / close` in `native/probe.cpp` — **case A: completely separate GPU globals** from the CPU path, mutually exclusive open. `PxCreateCudaContextManager` succeeded, `cuda_device_name = "NVIDIA GeForce RTX 5070 Ti"`, `broadphase_type="GPU"`, `gpu_dynamics_enabled=true`, **`fallback_detected=false`**. Empty-scene `simulate/fetchResults` succeeded across 2 cycles. CPU path regression-free. Blender did not crash | `052cffe` |
+| **5H** | CPU vs GPU **rigid-grid benchmark** (`physx_benchmark_rigid_grid_cpu/gpu` — local PhysX per call, no global pollution; sphere grid on ground plane; restitution=0). 100 / 1000 actors × 120 steps × dt=1/60. **Headline (avg step time)**: CPU 0.067 / GPU 0.789 ms @ 100 → CPU 0.778 / GPU 1.805 ms @ 1000. GPU **`fallback_detected=false`** confirmed both runs (device="NVIDIA GeForce RTX 5070 Ti", broadphase="GPU"). All runs `finite_check=true`, `nan_inf_count=0`. 100-actor checksums CPU/GPU near-identical; 1000-actor GPU settled less in 120 steps (solver-difference, spec allows). 5000-actor + Blender-mesh-collider variants deferred to a later phase | this commit |
 
 **Phase 3 left no repo changes by design.** Phases 4D, 4D2, 4E left no
 repo changes either (MCP-only). The committed Phase 4 surface is
@@ -154,6 +155,41 @@ discovery** — production bundling is deferred.
   next zip build (whenever Phase 5G is promoted from dev-mode) must
   carry the updated loader. The committed repo `_native_loader.py` is
   the source of truth.
+
+---
+
+## Phase 5H benchmark headline (CPU vs GPU rigid grid)
+
+First side-by-side comparison of CPU vs GPU PhysX on a controlled
+workload. Method: local PhysX stack per call, sphere grid above a static
+ground plane, restitution=0, 120 steps, dt=1/60, sphere radius=0.05,
+density=1.0, spacing=0.2, grid_origin_y=1.0.
+
+| actors | CPU avg step | GPU avg step | GPU / CPU |
+|---:|---:|---:|---:|
+| 100  | **0.067 ms** | **0.789 ms** | 11.8× slower (GPU loses) |
+| 1000 | **0.778 ms** | **1.805 ms** | 2.3× slower (GPU loses, gap narrows) |
+
+Scaling exponent across 100 → 1000 actors (10× workload):
+
+* CPU: time × 11.6 → exponent ~1.07 (super-linear)
+* GPU: time × 2.29 → exponent ~0.36 (sub-linear)
+
+**Stance:** GPU fixed overhead (CUDA scene_create ~86–110 ms,
+warmup_step ~1.6–1.9 ms) dominates at small actor counts, so GPU is
+not the answer for handfuls of actors. As the workload grows the GPU
+scaling curve is much flatter than the CPU one, so a crossover exists
+somewhere above 1000 actors. Phase 5H deliberately stopped at 1000 to
+keep the implementation phases moving — the 5000-actor data point and
+the Blender-mesh-collider variant (5H-B) are deferred until a phase
+that actually needs them.
+
+`fallback_detected=false` on every GPU run (`device="NVIDIA GeForce
+RTX 5070 Ti"`, `broadphase_type="GPU"`, `gpu_dynamics_enabled=true`).
+All runs `finite_check=true`, `nan_inf_count=0`. CPU and GPU final
+positions are not bit-identical (PhysX CPU and GPU solvers differ
+numerically) but are physically plausible; 100-actor checksums matched
+to ~1e-5, 1000-actor GPU settled slightly less in 120 steps.
 
 ---
 
