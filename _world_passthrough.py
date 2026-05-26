@@ -1,24 +1,49 @@
-"""Hair Simulation — VBD-direction Phase 1: NVIDIA Newton VBD solver
-plugged into the v0.0.30 scaffolding (three-mode lifecycle + RAM bake).
+"""Hair Simulation — VBD-direction Phase 2: head-tracked VBD (α strategy).
 
 **What this module owns**
 
   * The per-frame state (positions + velocities in world coords) held
-    in `_prev_state`. Single source of truth, updated only by
-    `_capture_current_state`. See "Why" note below.
+    in `_prev_state`. Updated by exactly two authors, each of which
+    commits both fields atomically at the end of the function:
+      - `_capture_current_state` (reads EVALUATED from Blender; used
+        on Start, Reset, frame-jump)
+      - `_run_one_simulation_step` (uses VBD output; used on +1 step)
   * The full-animation RAM bake: parallel arrays
     `_bake_positions[n_frames, n_total, 3]` and
     `_bake_velocities[n_frames, n_total, 3]` plus a per-frame
     `_bake_mask` boolean. Allocated once at Start (or reused if size
     matches), sized by the scene's animation length.
   * The simulation step: NVIDIA Newton's `SolverVBD`. Hair roots are
-    kinematic (mass=0 → fixed); other points are integrated under
+    kinematic (mass=0 → driven by us each step from the evaluated
+    Surface Deform output); other points are integrated under
     gravity + per-strand spring forces. Sloppy physics constants for
     the explosion test: any non-zero stiffness/damping; user-approved
     that hair may visibly explode as long as Python does not crash.
   * The scrub-restore behaviour: if the user enters a frame that has
     been baked, the baked state is pushed back to Blender — the
     simulator never re-derives it.
+
+**α strategy: head-tracked roots + modifier offset compensation**
+
+User-chosen pragmatic approach (acknowledged as not the architecturally
+"pure" way; see CLAUDE.md / commit history for the discussion):
+
+  * Surface Deform GN modifier ("サーフェス変形") stays active and is
+    NOT muted. It provides per-frame head-tracked anchor positions
+    via the EVALUATED Curves.
+  * Every sim step:
+      1. Read evaluated world positions (head-tracked) for all points.
+      2. Read original world positions (what we wrote last frame).
+      3. offset = evaluated - original  (per-particle additive modifier
+         contribution; v0.0.27 verified the modifier composes ~additively).
+      4. Build VBD input: prev non-root positions + new evaluated roots;
+         derived root velocity = (new_eval - prev) / dt.
+      5. VBD step → vbd_out in world coords, head-tracked.
+      6. Write to ORIGINAL: vbd_out - offset. Modifier then produces
+         evaluated = (vbd_out - offset) + offset = vbd_out → matches
+         what VBD intended. No double-tracking.
+  * `_prev_state` after each sim = VBD output (vbd_out), so the next
+    step's "previous frame" is the head-tracked world view.
 
 **What this module does NOT own**
 
@@ -91,6 +116,16 @@ VBD_SPRING_KD          = 1.0     # spring damping
 VBD_FREE_PARTICLE_MASS = 1.0     # mass for non-root particles
 VBD_GRAVITY            = -9.81   # m/s² along the up-axis (Z down)
 VBD_ITERATIONS         = 8       # VBD solver iterations per step
+
+# Self-contact (particle-particle collision). Newton's SolverVBD has this
+# OFF by default; for densely-packed curves like hair, that lets strands
+# pass through each other and the energy of overlapping particles blows up
+# (matches the "no self-collision = explosion" experience from Houdini).
+# Default radius/margin (0.2 m) is way too big for hair points spaced
+# at a few cm; use small values appropriate to per-point spacing.
+VBD_SELF_CONTACT_ENABLED = True
+VBD_SELF_CONTACT_RADIUS  = 0.005   # 5 mm per particle
+VBD_SELF_CONTACT_MARGIN  = 0.005   # 5 mm collision-search margin
 # Newton 1.2.0 / Warp 1.13.0 on RTX 5070 Ti (sm_120 Blackwell):
 # `cuda:0` finalize() succeeds but step() triggers "CUDA error 700:
 # illegal memory access" mid-kernel, which corrupts the CUDA context
@@ -128,6 +163,7 @@ class WorldPassthrough:
 
         # Curves shape constants captured at Start.
         self._n_total           = 0
+        self._root_indices      = None  # type: np.ndarray | None  shape (n_strands,) int32
 
         # State evolution bookkeeping — ALWAYS updated together.
         self._last_frame        = None  # type: int | None
@@ -251,13 +287,40 @@ class WorldPassthrough:
     # State capture (single source of truth for _prev_state writes)
     # ----------------------------------------------------------- #
 
+    def _read_world_positions(
+        self,
+        attributes_owner,
+    ) -> np.ndarray | None:
+        """Helper: read `position` from any attributes-owning data
+        (`obj.data` for ORIGINAL or `obj.evaluated_get(dg).data` for
+        EVALUATED / post-modifier), and convert to world coords via
+        the Curves object's matrix_world. Returns (n_total, 3) float32
+        or None on any sanity failure."""
+        attr = attributes_owner.attributes.get("position")
+        if attr is None or len(attr.data) != self._n_total:
+            return None
+        n = self._n_total
+        local_flat = np.zeros(n * 3, dtype=np.float32)
+        attr.data.foreach_get("vector", local_flat)
+        local_pts = local_flat.reshape(n, 3)
+
+        obj = bpy.data.objects.get(self._target_obj_name)
+        if obj is None:
+            return None
+        mw      = np.array(obj.matrix_world, dtype=np.float32)
+        local_h = np.column_stack([local_pts, np.ones(n, dtype=np.float32)])
+        world_h = local_h @ mw.T
+        return world_h[:, :3].astype(np.float32, copy=True)
+
     def _capture_current_state(
         self,
         scene: bpy.types.Scene,
         derive_velocity_from_prev: bool = False,
     ) -> bool:
         """Snapshot the current frame's full hair state (positions +
-        velocities, world coords).
+        velocities, world coords) — read from the EVALUATED data
+        (post-Surface-Deform), so `_prev_state` always reflects the
+        head-tracked world view.
 
         **Atomicity guarantee** (load-bearing for physics correctness):
         `_last_frame` and `_prev_state` are updated together at the end
@@ -282,26 +345,19 @@ class WorldPassthrough:
             self._last_frame = None
             self._prev_state = None
             return False
-        attr = obj.data.attributes.get("position")
-        if attr is None or len(attr.data) != self._n_total:
+
+        # Read EVALUATED (post-modifier) positions — these include the
+        # Surface Deform head-tracking offset, so prev_state.points_world
+        # is the head-tracked world view of the hair.
+        dg = bpy.context.evaluated_depsgraph_get()
+        obj_eval = obj.evaluated_get(dg)
+        world_pts = self._read_world_positions(obj_eval.data)
+        if world_pts is None:
             self._last_frame = None
             self._prev_state = None
             return False
 
-        n = self._n_total
-
-        # 1. Read ORIGINAL (local-space) positions.
-        local_flat = np.zeros(n * 3, dtype=np.float32)
-        attr.data.foreach_get("vector", local_flat)
-        local_pts = local_flat.reshape(n, 3)
-
-        # 2. Convert local → world via matrix_world.
-        mw      = np.array(obj.matrix_world, dtype=np.float32)
-        local_h = np.column_stack([local_pts, np.ones(n, dtype=np.float32)])
-        world_h = local_h @ mw.T
-        world_pts = world_h[:, :3].astype(np.float32, copy=True)
-
-        # 3. Derive velocities (or zero them on re-baselining events).
+        # Derive velocities (or zero them on re-baselining events).
         if (
             derive_velocity_from_prev
             and prior is not None
@@ -314,7 +370,7 @@ class WorldPassthrough:
         else:
             velocities_world = np.zeros_like(world_pts)
 
-        # 4. Atomic commit: both fields updated together at the end.
+        # Atomic commit: both fields updated together at the end.
         self._prev_state = HairFrameState(
             points_world     = world_pts,
             velocities_world = velocities_world,
@@ -393,7 +449,13 @@ class WorldPassthrough:
                 device = "cpu"
 
             self._vbd_model       = model
-            self._vbd_solver      = newton.solvers.SolverVBD(model, iterations=VBD_ITERATIONS)
+            self._vbd_solver      = newton.solvers.SolverVBD(
+                model,
+                iterations                    = VBD_ITERATIONS,
+                particle_enable_self_contact  = VBD_SELF_CONTACT_ENABLED,
+                particle_self_contact_radius  = VBD_SELF_CONTACT_RADIUS,
+                particle_self_contact_margin  = VBD_SELF_CONTACT_MARGIN,
+            )
             self._vbd_state_in    = model.state()
             self._vbd_state_out   = model.state()
             self._vbd_control     = model.control()
@@ -404,7 +466,9 @@ class WorldPassthrough:
                 f"[hair_sim/vbd] initialized on {device}: "
                 f"n_particles={n}, n_springs={n_strands * (POINTS_PER_STRAND - 1)}, "
                 f"iterations={VBD_ITERATIONS}, ke={VBD_SPRING_KE}, kd={VBD_SPRING_KD}, "
-                f"gravity={VBD_GRAVITY}"
+                f"gravity={VBD_GRAVITY}, "
+                f"self_contact={VBD_SELF_CONTACT_ENABLED} "
+                f"(r={VBD_SELF_CONTACT_RADIUS}, m={VBD_SELF_CONTACT_MARGIN})"
             )
             return True
         except Exception as exc:
@@ -416,40 +480,86 @@ class WorldPassthrough:
             self._vbd_device = None
             return False
 
-    def _run_one_simulation_step(self, scene: bpy.types.Scene) -> None:
+    def _run_one_simulation_step(self, scene: bpy.types.Scene) -> bool:
         """Evolve state by exactly one frame using Newton's VBD solver.
 
-        Explosion-test setup (per user spec): hair root particles are
-        kinematic (mass=0, fixed at the position the rig + scrub-restore
-        provides), all other particles are subject to gravity and spring
-        forces with sloppy non-zero stiffness/damping values. No
-        collision is added. Hair is allowed to fly apart; the bar for
-        success is that Python (and Blender) does not crash."""
+        **Strategy α — head-tracked roots + modifier-offset compensation**
+
+        The hair roots' world positions for the new frame are taken from
+        the EVALUATED Curves (Surface Deform output), so VBD sees the
+        head motion as a moving boundary condition. The non-root
+        particles' world positions are carried over from the previous
+        sim's output (held in `_prev_state`).
+
+          Input to VBD:
+            q [non_root]  = _prev_state.points_world[non_root]
+            q [root]      = evaluated_world[root]                      ← head boundary
+            qd[non_root]  = _prev_state.velocities_world[non_root]
+            qd[root]      = (evaluated_world[root]
+                             - _prev_state.points_world[root]) / dt    ← head velocity
+
+        Spring forces (rest length fixed at the initial geometry) pull
+        the non-root particles toward the moved roots over subsequent
+        iterations, producing inertial trailing of the hair tips.
+
+        VBD output is in world coords and is "head-tracked" (because
+        the input was). To display correctly, we must NOT let the
+        Surface Deform modifier add its head-tracking offset on top
+        again. We measure the modifier's per-particle additive offset
+        (`offset = evaluated - original`) and subtract it from the VBD
+        output before writing to ORIGINAL. Modifier then computes
+        `evaluated = written + offset = vbd_out`, matching VBD's view.
+
+        Returns True on successful update (prev_state + _last_frame
+        atomically committed), False on any failure (state unchanged)."""
         if self._prev_state is None:
-            return
+            return False
         obj = bpy.data.objects.get(self._target_obj_name)
         if obj is None:
-            return
+            return False
         if not self._ensure_vbd_initialized():
-            return
+            return False
 
         wp     = self._vbd_module_warp
         n      = self._n_total
         device = self._vbd_device
 
+        # 1. Read EVALUATED (head-tracked) world positions for this frame
+        #    and the ORIGINAL (what we wrote last frame) world positions.
+        #    The difference is the modifier's per-particle additive
+        #    offset, used both for the (iii) writeback compensation and
+        #    as the source of the new root anchor positions.
+        dg = bpy.context.evaluated_depsgraph_get()
+        obj_eval = obj.evaluated_get(dg)
+        eval_world = self._read_world_positions(obj_eval.data)
+        orig_world = self._read_world_positions(obj.data)
+        if eval_world is None or orig_world is None:
+            return False
+        offset_world = eval_world - orig_world   # (n, 3) float32
+
+        # 2. Build VBD input state. Carry non-root positions/velocities
+        #    from previous sim; override roots with current evaluated
+        #    positions and derived velocity (head motion this frame).
+        dt = float(scene.render.fps_base) / float(scene.render.fps)
+
+        in_q  = self._prev_state.points_world.copy()
+        in_qd = self._prev_state.velocities_world.copy()
+
+        root_indices = self._root_indices  # cached (n_strands,) int32
+        in_q [root_indices]  = eval_world[root_indices]
+        in_qd[root_indices]  = (
+            (eval_world[root_indices] - self._prev_state.points_world[root_indices]) / dt
+        ).astype(np.float32, copy=False)
+
         try:
-            # 1. Copy `_prev_state` into the solver's input state.
-            #    wp.from_numpy on a (n, 3) float32 array with dtype=wp.vec3
-            #    yields a wp.array(shape=(n,), dtype=wp.vec3).
-            pts_np = np.ascontiguousarray(self._prev_state.points_world,     dtype=np.float32)
-            vel_np = np.ascontiguousarray(self._prev_state.velocities_world, dtype=np.float32)
-            tmp_q  = wp.from_numpy(pts_np, dtype=wp.vec3, device=device)
-            tmp_qd = wp.from_numpy(vel_np, dtype=wp.vec3, device=device)
+            in_q_np  = np.ascontiguousarray(in_q,  dtype=np.float32)
+            in_qd_np = np.ascontiguousarray(in_qd, dtype=np.float32)
+            tmp_q  = wp.from_numpy(in_q_np,  dtype=wp.vec3, device=device)
+            tmp_qd = wp.from_numpy(in_qd_np, dtype=wp.vec3, device=device)
             wp.copy(self._vbd_state_in.particle_q,  tmp_q)
             wp.copy(self._vbd_state_in.particle_qd, tmp_qd)
 
-            # 2. Step.
-            dt = float(scene.render.fps_base) / float(scene.render.fps)
+            # 3. Step.
             self._vbd_solver.step(
                 self._vbd_state_in,
                 self._vbd_state_out,
@@ -458,26 +568,56 @@ class WorldPassthrough:
                 dt,
             )
 
-            # 3. Read positions out (GPU → CPU copy).
-            world_pts = self._vbd_state_out.particle_q.numpy()
-            world_pts = np.ascontiguousarray(world_pts, dtype=np.float32).reshape(n, 3)
+            # 4. Read positions out. We must COPY here, not view —
+            #    wp.array.numpy() on CPU returns a buffer view backed by
+            #    the same memory as state_out.particle_q. If we kept the
+            #    view, the next solver.step() would update state_out
+            #    in-place and our `_prev_state.points_world` reference
+            #    would silently change with it, breaking the velocity
+            #    derivation below (which would become
+            #    (vbd_out_new - vbd_out_new) / dt = 0).
+            vbd_out = np.array(
+                self._vbd_state_out.particle_q.numpy(),
+                dtype=np.float32, copy=True,
+            ).reshape(n, 3)
         except Exception as exc:
             print(f"[hair_sim/vbd] step failed (suppressing): {exc!r}")
-            return
+            return False
 
-        # 4. Convert world → local and write to ORIGINAL.
+        # 5. Writeback with modifier-offset compensation:
+        #    target_eval = vbd_out, modifier(written) = written + offset,
+        #    so write = vbd_out - offset → modifier produces vbd_out.
+        write_world = vbd_out - offset_world
+
+        # Convert world → local via matrix_world.inverted() and write.
         mw_inv  = np.array(obj.matrix_world.inverted(), dtype=np.float32)
-        world_h = np.column_stack([world_pts, np.ones(n, dtype=np.float32)])
+        world_h = np.column_stack([write_world, np.ones(n, dtype=np.float32)])
         local_h = world_h @ mw_inv.T
         local_pts = local_h[:, :3].astype(np.float32, copy=True)
 
         attr = obj.data.attributes.get("position")
         if attr is None or len(attr.data) != n:
-            return
-        # local_pts is C-contiguous (astype(copy=True) above), so ravel()
-        # returns a view; foreach_set accepts numpy arrays directly.
+            return False
         attr.data.foreach_set("vector", local_pts.ravel())
         obj.data.update_tag()
+
+        # 6. Atomic commit of prev_state + _last_frame.
+        #    Note: this is the second author of (_last_frame, _prev_state)
+        #    besides _capture_current_state. Both update both fields at
+        #    the end, never leaving them inconsistent. This is the
+        #    "after-sim" author; capture is the "from-Blender" author.
+        #    Velocity derived from position diff (matches capture's
+        #    derive_velocity_from_prev=True convention).
+        new_vel = ((vbd_out - self._prev_state.points_world) / dt).astype(
+            np.float32, copy=False
+        )
+        self._prev_state = HairFrameState(
+            points_world     = vbd_out,
+            velocities_world = new_vel,
+            frame            = scene.frame_current,
+        )
+        self._last_frame = scene.frame_current
+        return True
 
     # ----------------------------------------------------------- #
     # Lifecycle
@@ -538,6 +678,12 @@ class WorldPassthrough:
         self._step_count      = 0
         self._initialized     = True
 
+        # Cache root indices (one per strand) for fast per-step
+        # override of the head-tracked anchor positions.
+        n_strands = n_total // POINTS_PER_STRAND
+        self._root_indices = (np.arange(n_strands, dtype=np.int32)
+                              * POINTS_PER_STRAND)
+
         # Invalidate any cached VBD state — the topology snapshot inside
         # the Newton model assumes the rest positions captured at this
         # Start. First sim step will rebuild it from the new _prev_state.
@@ -574,6 +720,7 @@ class WorldPassthrough:
         Operator Stop / Bypass do NOT teardown — they only change mode."""
         self._last_frame        = None
         self._prev_state        = None
+        self._root_indices      = None
         self._bake_positions    = None
         self._bake_velocities   = None
         self._bake_mask         = None
@@ -617,10 +764,16 @@ class WorldPassthrough:
 
             # 2. Consecutive +1 frame, not yet baked → simulate.
             if M == self._last_frame + 1:
-                self._run_one_simulation_step(scene)
-                self._capture_current_state(scene, derive_velocity_from_prev=True)
-                self._store_prev_state_to_bake()
-                self._step_count += 1
+                # _run_one_simulation_step now performs its own atomic
+                # commit of (_prev_state, _last_frame) from VBD output —
+                # we do NOT call _capture afterwards (that would re-read
+                # the just-written Blender data, but the depsgraph
+                # evaluation for that write hasn't run yet, and the VBD
+                # output is the authoritative truth for this frame).
+                ok = self._run_one_simulation_step(scene)
+                if ok:
+                    self._store_prev_state_to_bake()
+                    self._step_count += 1
                 return True
 
             # 3. Jump into unbaked territory → re-baseline.
