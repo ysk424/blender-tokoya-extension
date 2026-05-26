@@ -35,6 +35,7 @@ _PYTHON_USER_SITE = r"C:\Users\azoo\AppData\Roaming\Python\Python313\site-packag
 # ---- Simulation parameters (written from WM at each Start) ----
 SPRING_KE              = 1e4
 DAMPING                = 0.01
+SPRING_KD              = DAMPING   # backward-compat alias (remove after v0.0.60)
 PARTICLE_MASS          = 1.0
 GRAVITY                = -9.81
 ITERATIONS             = 10
@@ -253,7 +254,7 @@ class WorldPassthrough:
             print(
                 f"[hair_sim/taichi] solver ready: "
                 f"n={self._n_total}, strands={n_strands}, pps={POINTS_PER_STRAND}, "
-                f"ke={SPRING_KE}, kd={SPRING_KD}, iter={ITERATIONS}, sub={SUBSTEPS}"
+                f"ke={SPRING_KE}, damping={DAMPING}, iter={ITERATIONS}, sub={SUBSTEPS}"
             )
             return True
         except Exception as exc:
