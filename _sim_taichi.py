@@ -77,7 +77,13 @@ def get_solver_class():
             self.bend_rest = ti.field(dtype=ti.f32, shape=bend_shape)
 
             # Root positions written by Python before each substep
-            self.roots     = ti.Vector.field(3, dtype=ti.f32, shape=n_strands)
+            self.roots      = ti.Vector.field(3, dtype=ti.f32, shape=n_strands)
+
+            # Rest offset from root (point 0) to point 1 in world coords,
+            # captured at Start. Point 1 is kinematic: driven as
+            # root_current + seg1_offset each substep, simulating a hair
+            # follicle that locks the first segment to the scalp direction.
+            self.seg1_offset = ti.Vector.field(3, dtype=ti.f32, shape=n_strands)
 
             self._setup(init_pos, particle_mass, bending_enabled)
 
@@ -94,8 +100,15 @@ def get_solver_class():
             self.pos_pred.from_numpy(pos_f)
 
             inv_m = np.full(n, 1.0 / particle_mass, dtype=np.float32)
-            inv_m[np.arange(ns, dtype=np.int32) * pps] = 0.0   # roots kinematic
+            root_idx = np.arange(ns, dtype=np.int32) * pps
+            inv_m[root_idx]     = 0.0   # point 0: kinematic (head-tracked)
+            inv_m[root_idx + 1] = 0.0   # point 1: kinematic (follicle direction)
             self.inv_mass.from_numpy(inv_m)
+
+            # seg1_offset: world-space offset from root to point 1 at rest.
+            # As the root moves with the head, point 1 follows: p1 = root + offset.
+            seg1_off = pos_f[root_idx + 1] - pos_f[root_idx]  # (ns, 3)
+            self.seg1_offset.from_numpy(np.ascontiguousarray(seg1_off, dtype=np.float32))
 
             # Segment rest lengths
             sr = np.zeros((ns, pps - 1), dtype=np.float32)
@@ -124,14 +137,25 @@ def get_solver_class():
 
         @ti.kernel
         def _predict(self, dt: ti.f32, gravity: ti.f32):
-            """Apply gravity, advance free particles; set kinematic roots."""
+            """Apply gravity, advance free particles; set kinematic points.
+
+            k == 0: root — driven by head animation (roots field).
+            k == 1: follicle anchor — fixed at root + seg1_offset,
+                    simulating the skin-embedded hair follicle that locks
+                    the first segment to the scalp growth direction.
+            k >= 2: free particles — gravity + XPBD constraints.
+            """
             for i in range(self.n_total):
                 s = i // self.pps
                 k = i %  self.pps
                 if k == 0:
-                    # Kinematic root: set to pre-uploaded roots field
                     self.pos[i]      = self.roots[s]
                     self.pos_pred[i] = self.roots[s]
+                elif k == 1:
+                    # Follicle anchor: translates with root, keeps rest direction.
+                    p1 = self.roots[s] + self.seg1_offset[s]
+                    self.pos[i]      = p1
+                    self.pos_pred[i] = p1
                 else:
                     self.vel[i][2]   += gravity * dt
                     self.pos_pred[i]  = self.pos[i] + self.vel[i] * dt

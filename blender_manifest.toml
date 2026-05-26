@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "hair_sim_physx"
-version = "0.0.59"
+version = "0.0.60"
 name = "Katsura"
 tagline = "Hair physics simulation — Taichi XPBD"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"

@@ -296,8 +296,10 @@ class WorldPassthrough:
         new_root_world = eval_world[self._root_indices]  # (n_strands, 3)
 
         # Root mask: True for kinematic particles (skip in body collision).
+        # point 0 = head-tracked root, point 1 = follicle anchor — both kinematic.
         root_mask = np.zeros(self._n_total, dtype=bool)
-        root_mask[self._root_indices] = True
+        root_mask[self._root_indices]     = True   # point 0
+        root_mask[self._root_indices + 1] = True   # point 1
 
         # Upload prev frame state to solver.
         self._taichi_solver.set_positions_velocities(
