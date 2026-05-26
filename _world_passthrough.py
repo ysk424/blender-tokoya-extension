@@ -294,36 +294,44 @@ class WorldPassthrough:
         # Root world positions for this frame.
         new_root_world = eval_world[self._root_indices]  # (n_strands, 3)
 
+        # Root mask: True for kinematic particles (skip in body collision).
+        root_mask = np.zeros(self._n_total, dtype=bool)
+        root_mask[self._root_indices] = True
+
         # Upload prev frame state to solver.
         self._taichi_solver.set_positions_velocities(
             self._prev_state.points_world,
             self._prev_state.velocities_world,
         )
 
-        # Run XPBD on GPU.
+        # Build body collision callback (BVH rebuilt each frame for animated body).
         from . import _sim_taichi
-        sim_out = self._taichi_solver.run_frame(
-            dt              = dt,
-            n_substeps      = SUBSTEPS,
-            n_iter          = ITERATIONS,
-            gravity         = GRAVITY,
-            new_root_world  = new_root_world,
-            seg_ke          = SPRING_KE,
-            bend_ke         = BENDING_KE,
-            damping         = SPRING_KD,
-            bending_enabled = BENDING_ENABLED,
-        )  # (n_total, 3) float32
-
-        # Body collision (optional, Python BVHTree — once per frame).
+        body_collision_fn = None
         if BODY_COLLISION_ENABLED:
-            try:
-                bvh = _sim_taichi.build_body_bvh(BODY_COLLISION_TARGET)
-                if bvh is not None:
-                    _sim_taichi.apply_body_collision(sim_out, bvh)
-                    # Sync corrected positions back to solver for next frame's vel.
-                    self._taichi_solver.upload_corrected_positions(sim_out)
-            except Exception as exc:
-                print(f"[hair_sim/taichi] body collision error (suppressed): {exc!r}")
+            bvh = _sim_taichi.build_body_bvh(BODY_COLLISION_TARGET)
+            if bvh is not None:
+                def body_collision_fn(pred_np, _bvh=bvh, _mask=root_mask):
+                    n = _sim_taichi.apply_body_collision(
+                        pred_np, _bvh, root_mask=_mask, margin=0.005
+                    )
+                    if n > 0:
+                        print(f"[hair_sim/collision] pushed {n} particles")
+            else:
+                print(f"[hair_sim/collision] WARNING: BVH build failed for '{BODY_COLLISION_TARGET}'")
+
+        # Run XPBD on GPU (body collision integrated per substep).
+        sim_out = self._taichi_solver.run_frame(
+            dt                 = dt,
+            n_substeps         = SUBSTEPS,
+            n_iter             = ITERATIONS,
+            gravity            = GRAVITY,
+            new_root_world     = new_root_world,
+            seg_ke             = SPRING_KE,
+            bend_ke            = BENDING_KE,
+            damping            = SPRING_KD,
+            bending_enabled    = BENDING_ENABLED,
+            body_collision_fn  = body_collision_fn,
+        )  # (n_total, 3) float32
 
         # Writeback with modifier-offset compensation.
         write_world = sim_out - offset_world

@@ -199,8 +199,13 @@ def get_solver_class():
             self.vel.from_numpy(np.ascontiguousarray(vel_np, dtype=np.float32))
 
         def upload_corrected_positions(self, pos_np: np.ndarray):
-            """After body collision, sync corrected positions back to GPU."""
+            """Sync corrected positions (e.g. after body collision) into pos."""
             self.pos.from_numpy(np.ascontiguousarray(pos_np, dtype=np.float32))
+
+        def upload_pred_positions(self, pred_np: np.ndarray):
+            """Sync corrected positions into pos_pred (called within substep
+            after body collision, before _update_vel_pos)."""
+            self.pos_pred.from_numpy(np.ascontiguousarray(pred_np, dtype=np.float32))
 
         def get_positions_numpy(self) -> np.ndarray:
             return self.pos.to_numpy()
@@ -223,19 +228,32 @@ def get_solver_class():
             bend_ke:         float,
             damping:         float,
             bending_enabled: bool,
+            body_collision_fn = None,       # callable(pred_np) → None, or None
         ) -> np.ndarray:
-            """Run one Blender frame → return final (n_total, 3) positions."""
+            """Run one Blender frame → return final (n_total, 3) positions.
+
+            body_collision_fn: if given, called on pos_pred (n_total,3) float32
+            after each substep's constraint loop and BEFORE _update_vel_pos.
+            It modifies the array in-place (push particles out of body).
+            Because the correction lands in pos_pred, _update_vel_pos derives
+            velocity = (pos_pred - pos) / dt which automatically includes the
+            collision push — no separate velocity clamping needed.
+            """
             dt_sub   = float(dt) / float(n_substeps)
             roots_np = np.ascontiguousarray(new_root_world, dtype=np.float32)
             do_bend  = int(bending_enabled)
 
             for _ in range(n_substeps):
-                # Upload root positions to GPU field (no kernel needed)
                 self.roots.from_numpy(roots_np)
                 self._predict(dt_sub, float(gravity))
                 for _ in range(n_iter):
                     self._solve_springs(dt_sub, float(seg_ke),
                                         float(bend_ke), do_bend)
+                # Body collision: modify pos_pred, then derive velocity normally.
+                if body_collision_fn is not None:
+                    pred_np = self.pos_pred.to_numpy()
+                    body_collision_fn(pred_np)          # push out, in-place
+                    self.upload_pred_positions(pred_np)
                 self._update_vel_pos(dt_sub, float(damping))
 
             return self.pos.to_numpy()
@@ -259,17 +277,38 @@ def build_body_bvh(body_name: str):
     return BVHTree.FromObject(body_obj.evaluated_get(dg), dg, epsilon=0.0)
 
 
-def apply_body_collision(positions: np.ndarray, bvh, margin: float = 0.003) -> None:
-    """Push hair particles out of body mesh. Modifies positions in-place."""
+def apply_body_collision(
+    positions:  np.ndarray,     # (n_total, 3) float32, world — modified in-place
+    bvh,
+    root_mask:  np.ndarray = None,  # (n_total,) bool — True = kinematic root, skip
+    margin:     float = 0.005,
+) -> int:
+    """Push hair particles out of the body mesh surface.
+
+    Returns the number of particles that were corrected (for diagnostics).
+
+    Uses BVHTree.find_nearest: compute depth = (pt - nearest_surface).dot(face_normal).
+    depth > 0 → outside; depth < 0 → inside.
+    Any particle with depth < margin is pushed outward to depth == margin.
+
+    Kinematic root particles (root_mask[i] == True) are skipped because
+    they are driven by the head animation and must stay on the scalp.
+    """
     from mathutils import Vector
-    for i in range(len(positions)):
+    n_pushed = 0
+    n = len(positions)
+    for i in range(n):
+        if root_mask is not None and root_mask[i]:
+            continue                        # skip kinematic roots
         pt             = Vector(positions[i])
         loc, normal, _, _ = bvh.find_nearest(pt)
         if loc is None or normal is None:
             continue
-        depth = (pt - loc).dot(normal)   # >0 = outside, <0 = inside
+        depth = (pt - loc).dot(normal)      # >0 outside, <0 inside
         if depth < margin:
             c = normal * (margin - depth)
             positions[i, 0] += c.x
             positions[i, 1] += c.y
             positions[i, 2] += c.z
+            n_pushed += 1
+    return n_pushed
