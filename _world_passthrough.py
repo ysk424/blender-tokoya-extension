@@ -1,5 +1,5 @@
-"""Hair Simulation — VBD-direction Phase 0: state-evolution scaffolding
-with RAM bake cache + three-mode lifecycle (Bypass / Simulating / Playback).
+"""Hair Simulation — VBD-direction Phase 1: NVIDIA Newton VBD solver
+plugged into the v0.0.30 scaffolding (three-mode lifecycle + RAM bake).
 
 **What this module owns**
 
@@ -11,8 +11,11 @@ with RAM bake cache + three-mode lifecycle (Bypass / Simulating / Playback).
     `_bake_velocities[n_frames, n_total, 3]` plus a per-frame
     `_bake_mask` boolean. Allocated once at Start (or reused if size
     matches), sized by the scene's animation length.
-  * The simulation step (currently a deterministic fake deformation
-    for end-to-end verification; replaced by VBD later).
+  * The simulation step: NVIDIA Newton's `SolverVBD`. Hair roots are
+    kinematic (mass=0 → fixed); other points are integrated under
+    gravity + per-strand spring forces. Sloppy physics constants for
+    the explosion test: any non-zero stiffness/damping; user-approved
+    that hair may visibly explode as long as Python does not crash.
   * The scrub-restore behaviour: if the user enters a frame that has
     been baked, the baked state is pushed back to Blender — the
     simulator never re-derives it.
@@ -79,9 +82,28 @@ import numpy as np
 
 TARGET_NAME        = "カーブ.001"
 POINTS_PER_STRAND  = 8       # Uniform per Phase 3A scene investigation.
-TEST_Z_PER_STEP    = 0.02    # World-Z increment applied to non-root points
-                             # each simulation step. Verification placeholder
-                             # until real VBD lands.
+
+# VBD sloppy physics values (intentionally arbitrary, per user spec for the
+# explosion test: any non-zero value is fine, zeros only allowed where
+# physically meaningful — currently only for the kinematic anchor mass).
+VBD_SPRING_KE          = 1000.0  # spring stiffness
+VBD_SPRING_KD          = 1.0     # spring damping
+VBD_FREE_PARTICLE_MASS = 1.0     # mass for non-root particles
+VBD_GRAVITY            = -9.81   # m/s² along the up-axis (Z down)
+VBD_ITERATIONS         = 8       # VBD solver iterations per step
+# Newton 1.2.0 / Warp 1.13.0 on RTX 5070 Ti (sm_120 Blackwell):
+# `cuda:0` finalize() succeeds but step() triggers "CUDA error 700:
+# illegal memory access" mid-kernel, which corrupts the CUDA context
+# for the rest of the Blender session. CPU mode runs the same model
+# at ~19 ms/step for 35k particles + 31k springs, which is fast
+# enough for the explosion test. Switch back to cuda:0 once Newton
+# fixes the sm_120 + kinematic-particle + spring combo (or once we
+# isolate which of those pieces is at fault).
+VBD_DEVICE             = "cpu"
+# Newton 1.2.0 is installed in user site (CLAUDE.md). Blender's bundled
+# Python doesn't add user site to sys.path by default; we addsitedir on
+# first VBD init.
+VBD_USER_SITE          = r"C:\Users\azoo\AppData\Roaming\Python\Python313\site-packages"
 
 
 @dataclass
@@ -117,6 +139,16 @@ class WorldPassthrough:
         self._bake_mask         = None  # type: np.ndarray | None  shape (n_frames,) bool
         self._bake_frame_start  = None  # type: int | None
         self._bake_frame_end    = None  # type: int | None
+
+        # VBD solver state (built lazily on first sim step; reset on Start /
+        # teardown). All arrays live on `_vbd_device`.
+        self._vbd_solver        = None
+        self._vbd_model         = None
+        self._vbd_state_in      = None
+        self._vbd_state_out     = None
+        self._vbd_control       = None
+        self._vbd_device        = None
+        self._vbd_module_warp   = None  # cached `import warp` handle
 
         # Per-call telemetry.
         self._step_count        = 0
@@ -292,42 +324,153 @@ class WorldPassthrough:
         return True
 
     # ----------------------------------------------------------- #
-    # Simulation (placeholder — real VBD lands here)
+    # Simulation — NVIDIA Newton VBD (explosion test)
     # ----------------------------------------------------------- #
 
+    def _ensure_vbd_initialized(self) -> bool:
+        """Lazy-build the Newton VBD model + solver from the current
+        `_prev_state` topology. No-op if already built. Returns True on
+        success."""
+        if self._vbd_solver is not None:
+            return True
+        if self._prev_state is None:
+            return False
+
+        # Import Newton / Warp. Blender's bundled Python doesn't add the
+        # user site to sys.path; do it here on first use.
+        try:
+            import sys, site
+            if VBD_USER_SITE not in sys.path:
+                site.addsitedir(VBD_USER_SITE)
+            import newton
+            import warp as wp
+        except Exception as exc:
+            print(f"[hair_sim/vbd] import failed: {exc!r}")
+            return False
+
+        try:
+            builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=VBD_GRAVITY)
+
+            n         = self._n_total
+            n_strands = n // POINTS_PER_STRAND
+            init_pts  = self._prev_state.points_world
+
+            # Particles: roots (index % POINTS_PER_STRAND == 0) get mass=0
+            # which Newton treats as kinematic (fixed at the given position).
+            # Non-roots get a non-zero mass so they're integrated.
+            for k in range(n):
+                p = init_pts[k]
+                is_root = (k % POINTS_PER_STRAND) == 0
+                mass = 0.0 if is_root else VBD_FREE_PARTICLE_MASS
+                builder.add_particle(
+                    pos = (float(p[0]), float(p[1]), float(p[2])),
+                    vel = (0.0, 0.0, 0.0),
+                    mass = mass,
+                )
+
+            # Springs along each strand. Rest length is auto-derived by
+            # ModelBuilder from the initial particle positions.
+            for s in range(n_strands):
+                base = s * POINTS_PER_STRAND
+                for i in range(POINTS_PER_STRAND - 1):
+                    builder.add_spring(
+                        base + i, base + i + 1,
+                        ke=VBD_SPRING_KE, kd=VBD_SPRING_KD, control=0.0,
+                    )
+
+            # SolverVBD requires graph-colored particles for parallel
+            # updates. finalize() does NOT color implicitly; we must do
+            # it explicitly between topology setup and finalize.
+            builder.color()
+
+            # Finalize on CUDA, fall back to CPU on any failure.
+            try:
+                model  = builder.finalize(device=VBD_DEVICE)
+                device = VBD_DEVICE
+            except Exception as exc:
+                print(f"[hair_sim/vbd] finalize on {VBD_DEVICE} failed: {exc!r}, falling back to cpu")
+                model  = builder.finalize(device="cpu")
+                device = "cpu"
+
+            self._vbd_model       = model
+            self._vbd_solver      = newton.solvers.SolverVBD(model, iterations=VBD_ITERATIONS)
+            self._vbd_state_in    = model.state()
+            self._vbd_state_out   = model.state()
+            self._vbd_control     = model.control()
+            self._vbd_device      = device
+            self._vbd_module_warp = wp
+
+            print(
+                f"[hair_sim/vbd] initialized on {device}: "
+                f"n_particles={n}, n_springs={n_strands * (POINTS_PER_STRAND - 1)}, "
+                f"iterations={VBD_ITERATIONS}, ke={VBD_SPRING_KE}, kd={VBD_SPRING_KD}, "
+                f"gravity={VBD_GRAVITY}"
+            )
+            return True
+        except Exception as exc:
+            print(f"[hair_sim/vbd] build failed: {exc!r}")
+            # Roll back partial state.
+            self._vbd_model = self._vbd_solver = None
+            self._vbd_state_in = self._vbd_state_out = None
+            self._vbd_control = None
+            self._vbd_device = None
+            return False
+
     def _run_one_simulation_step(self, scene: bpy.types.Scene) -> None:
-        """Evolve state by exactly one frame.
+        """Evolve state by exactly one frame using Newton's VBD solver.
 
-        **Placeholder today**: deterministic fake deformation. Non-root
-        points receive `world Z += TEST_Z_PER_STEP` each call. This is
-        the end-to-end smoke test that the (iii) writeback design
-        actually drives Blender; it stays until VBD replaces it.
-
-        The real VBD solver lands here later, preserving the contract:
-        `(_prev_state + Blender's current boundary) → new state → write
-        back to ORIGINAL`."""
+        Explosion-test setup (per user spec): hair root particles are
+        kinematic (mass=0, fixed at the position the rig + scrub-restore
+        provides), all other particles are subject to gravity and spring
+        forces with sloppy non-zero stiffness/damping values. No
+        collision is added. Hair is allowed to fly apart; the bar for
+        success is that Python (and Blender) does not crash."""
         if self._prev_state is None:
             return
         obj = bpy.data.objects.get(self._target_obj_name)
         if obj is None:
             return
+        if not self._ensure_vbd_initialized():
+            return
 
-        n = self._n_total
+        wp     = self._vbd_module_warp
+        n      = self._n_total
+        device = self._vbd_device
 
-        # 1. Start from the previously held world-coord state.
-        world_pts = self._prev_state.points_world.copy()
+        try:
+            # 1. Copy `_prev_state` into the solver's input state.
+            #    wp.from_numpy on a (n, 3) float32 array with dtype=wp.vec3
+            #    yields a wp.array(shape=(n,), dtype=wp.vec3).
+            pts_np = np.ascontiguousarray(self._prev_state.points_world,     dtype=np.float32)
+            vel_np = np.ascontiguousarray(self._prev_state.velocities_world, dtype=np.float32)
+            tmp_q  = wp.from_numpy(pts_np, dtype=wp.vec3, device=device)
+            tmp_qd = wp.from_numpy(vel_np, dtype=wp.vec3, device=device)
+            wp.copy(self._vbd_state_in.particle_q,  tmp_q)
+            wp.copy(self._vbd_state_in.particle_qd, tmp_qd)
 
-        # 2. Apply fake deformation in world space.
-        is_non_root = (np.arange(n) % POINTS_PER_STRAND) != 0
-        world_pts[is_non_root, 2] += TEST_Z_PER_STEP
+            # 2. Step.
+            dt = float(scene.render.fps_base) / float(scene.render.fps)
+            self._vbd_solver.step(
+                self._vbd_state_in,
+                self._vbd_state_out,
+                self._vbd_control,
+                None,   # contacts: none for this test
+                dt,
+            )
 
-        # 3. Convert world → local via matrix_world.inverted().
+            # 3. Read positions out (GPU → CPU copy).
+            world_pts = self._vbd_state_out.particle_q.numpy()
+            world_pts = np.ascontiguousarray(world_pts, dtype=np.float32).reshape(n, 3)
+        except Exception as exc:
+            print(f"[hair_sim/vbd] step failed (suppressing): {exc!r}")
+            return
+
+        # 4. Convert world → local and write to ORIGINAL.
         mw_inv  = np.array(obj.matrix_world.inverted(), dtype=np.float32)
         world_h = np.column_stack([world_pts, np.ones(n, dtype=np.float32)])
         local_h = world_h @ mw_inv.T
         local_pts = local_h[:, :3].astype(np.float32, copy=True)
 
-        # 4. Write back to ORIGINAL and tag depsgraph.
         attr = obj.data.attributes.get("position")
         if attr is None or len(attr.data) != n:
             return
@@ -395,6 +538,15 @@ class WorldPassthrough:
         self._step_count      = 0
         self._initialized     = True
 
+        # Invalidate any cached VBD state — the topology snapshot inside
+        # the Newton model assumes the rest positions captured at this
+        # Start. First sim step will rebuild it from the new _prev_state.
+        self._vbd_solver    = None
+        self._vbd_model     = None
+        self._vbd_state_in  = None
+        self._vbd_state_out = None
+        self._vbd_control   = None
+
         # Allocate (or reuse) the RAM bake. Clears mask either way.
         self._allocate_bake(scene)
 
@@ -427,6 +579,13 @@ class WorldPassthrough:
         self._bake_mask         = None
         self._bake_frame_start  = None
         self._bake_frame_end    = None
+        self._vbd_solver        = None
+        self._vbd_model         = None
+        self._vbd_state_in      = None
+        self._vbd_state_out     = None
+        self._vbd_control       = None
+        self._vbd_device        = None
+        self._vbd_module_warp   = None
         self._initialized       = False
         self._step_error_active = False
 
