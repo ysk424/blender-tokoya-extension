@@ -128,7 +128,14 @@ BODY_COLLISION_ENABLED  = True
 # (skip spring) is enabled per TinyVBD recipe.
 VBD_SPRING_KE          = 1e6     # spring stiffness (TinyVBD: 1e6–1e8)
 VBD_SPRING_KD          = 1.0     # spring damping
-VBD_FREE_PARTICLE_MASS = 1.0     # mass for non-root particles
+VBD_FREE_PARTICLE_MASS = 0.01    # mass for non-root particles
+                                 # ratio ke/mass = 1e8 matches TinyVBD's
+                                 # default test (1e8 stiffness / mass=1).
+                                 # Lower mass than 1.0 reduces visible
+                                 # inertial drag when the head moves;
+                                 # going further (0.001, 0.0001) caused
+                                 # spring overshoot / strand buckling
+                                 # (numerical instability at ke/m > 1e9).
 VBD_GRAVITY            = -9.81   # m/s² along the up-axis (Z down)
 VBD_ITERATIONS         = 60      # VBD inner iterations per solver.step()
                                  # (TinyVBD: 100)
