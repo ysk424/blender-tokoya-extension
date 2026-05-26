@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "hair_sim_physx"
-version = "0.0.49"
+version = "0.0.54"
 name = "Katsura"
 tagline = "Hair simulation skeleton (Phase 1)"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
@@ -22,6 +22,7 @@ paths = [
     "_native_loader.py",
     "_warp_kernels.py",
     "_world_passthrough.py",
+    "hair_sim_defaults.json",
     "native/phase2b_probe.cp313-win_amd64.pyd",
     "native/PhysX_64.dll",
     "native/PhysXCommon_64.dll",

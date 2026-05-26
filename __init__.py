@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
+
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import EnumProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, WindowManager
 
 from . import ui
@@ -12,6 +15,107 @@ from . import ui
 MODE_BYPASS     = "BYPASS"
 MODE_SIMULATING = "SIMULATING"
 MODE_PLAYBACK   = "PLAYBACK"
+
+
+# ---------------------------------------------------------------------------
+# Research parameter panel (REMOVE FOR PRODUCTION).
+#
+# Defaults live in hair_sim_defaults.json next to this file. At register
+# time we ABEND if the JSON is missing / unreadable / has missing keys
+# (per user spec: temporary research scaffold, no fallback). At
+# Start-operator time we snapshot the WM properties into the
+# _world_passthrough module constants — so Stop → change a value →
+# Start picks them up (Q2 = B, Stop/Start re-init only).
+# ---------------------------------------------------------------------------
+
+_PARAM_FLOAT_KEYS = (
+    "VBD_SPRING_KE",
+    "VBD_SPRING_KD",
+    "VBD_FREE_PARTICLE_MASS",
+    "VBD_GRAVITY",
+    "VBD_BENDING_KE",
+    "VBD_BENDING_KD",
+)
+_PARAM_INT_KEYS = (
+    "VBD_ITERATIONS",
+    "VBD_SUBSTEPS",
+)
+_PARAM_BOOL_KEYS = (
+    "VBD_BENDING_ENABLED",
+    "VBD_SELF_CONTACT_ENABLED",
+    "BODY_COLLISION_ENABLED",
+)
+_PARAM_STR_KEYS = (
+    "BODY_COLLISION_TARGET",
+)
+
+# WM attribute name = lowercased key prefixed with hair_sim_param_.
+def _wm_attr(const_name: str) -> str:
+    return "hair_sim_param_" + const_name.lower()
+
+
+def _load_defaults_json() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "hair_sim_defaults.json")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    required = (
+        _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
+    )
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise RuntimeError(
+            f"hair_sim_defaults.json missing keys: {missing}"
+        )
+    return data
+
+
+def _register_param_props(defaults: dict) -> None:
+    for key in _PARAM_FLOAT_KEYS:
+        setattr(WindowManager, _wm_attr(key), FloatProperty(
+            name=key, default=float(defaults[key]), options={"SKIP_SAVE"},
+        ))
+    for key in _PARAM_INT_KEYS:
+        setattr(WindowManager, _wm_attr(key), IntProperty(
+            name=key, default=int(defaults[key]), options={"SKIP_SAVE"},
+        ))
+    for key in _PARAM_BOOL_KEYS:
+        setattr(WindowManager, _wm_attr(key), BoolProperty(
+            name=key, default=bool(defaults[key]), options={"SKIP_SAVE"},
+        ))
+    for key in _PARAM_STR_KEYS:
+        setattr(WindowManager, _wm_attr(key), StringProperty(
+            name=key, default=str(defaults[key]), options={"SKIP_SAVE"},
+        ))
+
+
+def _unregister_param_props() -> None:
+    for key in (
+        _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
+    ):
+        try:
+            delattr(WindowManager, _wm_attr(key))
+        except Exception:
+            pass
+
+
+def _snapshot_params_into_passthrough(wm: bpy.types.WindowManager) -> None:
+    """Push current WM property values onto the _world_passthrough module
+    constants. Called at Start, BEFORE _solver.start() builds the VBD
+    model — so the values are picked up by the next sim build."""
+    from . import _world_passthrough as _wp
+    for key in (
+        _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
+    ):
+        setattr(_wp, key, getattr(wm, _wm_attr(key)))
+    print(
+        "[hair_sim] params snapshotted: "
+        f"ke={_wp.VBD_SPRING_KE} kd={_wp.VBD_SPRING_KD} "
+        f"mass={_wp.VBD_FREE_PARTICLE_MASS} g={_wp.VBD_GRAVITY} "
+        f"iter={_wp.VBD_ITERATIONS} sub={_wp.VBD_SUBSTEPS} "
+        f"bend={_wp.VBD_BENDING_ENABLED}/ke={_wp.VBD_BENDING_KE}/kd={_wp.VBD_BENDING_KD} "
+        f"selfc={_wp.VBD_SELF_CONTACT_ENABLED} "
+        f"body={_wp.BODY_COLLISION_ENABLED}/{_wp.BODY_COLLISION_TARGET}"
+    )
 
 
 class SolverInterface:
@@ -126,6 +230,11 @@ class HAIR_SIM_OT_start(Operator):
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
 
+        # Research panel: snapshot WM params into _world_passthrough
+        # constants BEFORE _solver.start() builds the VBD model.
+        # (REMOVE FOR PRODUCTION along with the rest of the param panel.)
+        _snapshot_params_into_passthrough(wm)
+
         from . import _native_loader
         native = _native_loader.get_native()
         if native is None:
@@ -189,6 +298,10 @@ _classes = (
 
 
 def register() -> None:
+    # Research param panel: load JSON first (ABEND on failure, per
+    # user spec). REMOVE FOR PRODUCTION.
+    _defaults = _load_defaults_json()
+
     for cls in _classes:
         bpy.utils.register_class(cls)
     WindowManager.hair_sim_mode = EnumProperty(
@@ -201,6 +314,7 @@ def register() -> None:
         default=MODE_BYPASS,
         options={"SKIP_SAVE"},
     )
+    _register_param_props(_defaults)  # REMOVE FOR PRODUCTION
     ui.register()
     _install_handler()
 
@@ -212,6 +326,7 @@ def unregister() -> None:
         pass
     _uninstall_handler()
     ui.unregister()
+    _unregister_param_props()  # REMOVE FOR PRODUCTION
     del WindowManager.hair_sim_mode
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

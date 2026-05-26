@@ -313,9 +313,27 @@ class WorldPassthrough:
         world_pts  = self._bake_positions [idx]
         velocities = self._bake_velocities[idx]
 
+        # v0.0.54: apply the same modifier-offset compensation that the
+        # SIMULATING path uses, so PLAYBACK and SIMULATING write byte-
+        # identical values to obj.data — and therefore produce the
+        # same modifier-applied visual. Before this, PLAYBACK wrote raw
+        # `world_pts` and the SD modifier composed an extra offset on
+        # top, producing a different (smoother but physically wrong)
+        # picture from SIM (user reported as v0.0.50 visual bug; image
+        # #19 = SIM = correct sea-urchin = actual VBD transient where
+        # head moves but tips lag in inertia).
+        dg       = bpy.context.evaluated_depsgraph_get()
+        obj_eval = obj.evaluated_get(dg)
+        eval_w   = self._read_world_positions(obj_eval.data)
+        orig_w   = self._read_world_positions(obj.data)
+        if eval_w is None or orig_w is None:
+            return False
+        offset_w    = eval_w - orig_w
+        write_world = world_pts - offset_w
+
         # Convert world → local via matrix_world.inverted() and write.
         mw_inv  = np.array(obj.matrix_world.inverted(), dtype=np.float32)
-        world_h = np.column_stack([world_pts, np.ones(n, dtype=np.float32)])
+        world_h = np.column_stack([write_world, np.ones(n, dtype=np.float32)])
         local_h = world_h @ mw_inv.T
         local_pts = local_h[:, :3].astype(np.float32, copy=True)
 
@@ -752,12 +770,35 @@ class WorldPassthrough:
         in_qd = self._prev_state.velocities_world.copy()
 
         root_indices = self._root_indices  # cached (n_strands,) int32
-        in_q [root_indices]  = eval_world[root_indices]
-        # ⚠ in_qd[root] MUST be zero — see function docstring. XPBD's
-        # predict step would double-integrate if a non-zero velocity is
-        # passed here; VBD may not have the same bug but the fix is
-        # harmless and we keep it defensively.
-        in_qd[root_indices]  = 0.0
+        # === Velocity-driven kinematic root (v0.0.52) ===
+        # Time-consistent initial state: ALL particles (root + free) start
+        # at their previous-frame positions. Root receives a velocity
+        # (NEW-PREV)/dt and is advanced manually per substep by
+        # V*dt_sub, so by the end of the frame it reaches NEW.
+        #
+        # Earlier broken variants:
+        #  - Original (≤ v0.0.49): in_q[root]=NEW, in_qd[root]=0.
+        #    Root teleported to NEW at substep 0; spring 0 saw a 5cm
+        #    discontinuous jump → strain energy VBD could not dissipate.
+        #    Per-frame residual error accumulated; frame 7→8 head motion
+        #    triggered explosion (mean stretch 1.9, max 448x).
+        #  - Trial 3 (v0.0.51): in_q advanced per substep by fraction,
+        #    in_qd[root]=0. Position trajectory correct but qd=0 broke
+        #    the spring-damping term `kd*(v_root - v_index1)` → chain
+        #    didn't propagate, explosion persisted (mean 1.99 frame 8).
+        #
+        # This variant: qd[root] = correct V is preserved across substeps
+        # so VBD's per-iteration damping term sees physical relative
+        # velocity. Position is advanced manually because Newton's VBD
+        # does NOT integrate mass=0 particles via x += v*dt (verified by
+        # standalone probe in this session: kinematic q stayed at input
+        # value regardless of qd).
+        prev_root_world = self._prev_state.points_world[root_indices].astype(
+            np.float32, copy=True
+        )
+        new_root_world  = eval_world[root_indices].astype(np.float32, copy=True)
+        root_vel        = (new_root_world - prev_root_world) / dt   # (n_strands, 3)
+        in_qd[root_indices] = root_vel
 
         try:
             # 3a. Refresh body-collision mesh to track body skinning at
@@ -784,7 +825,30 @@ class WorldPassthrough:
             dt_sub = dt / float(n_substeps)
             state_in  = self._vbd_state_in
             state_out = self._vbd_state_out
-            for _ in range(n_substeps):
+            # Per-substep root position increment so that after N substeps
+            # the cumulative advance equals (NEW - PREV) exactly.
+            root_delta_per_substep = root_vel * dt_sub   # (n_strands, 3)
+            for _k in range(n_substeps):
+                # Manual root integration (Newton VBD does NOT integrate
+                # mass=0 via x += v*dt; we do it ourselves):
+                #   q[root] += V * dt_sub  (cumulative advance toward NEW)
+                # qd[root] is re-injected = V so VBD's per-iteration
+                # spring damping term `kd*(v_root - v_index1)` sees the
+                # physical root velocity (not zero). Free-particle q/qd
+                # are preserved exactly: we only overwrite root entries.
+                _cur_q  = np.array(state_in.particle_q.numpy(),
+                                   dtype=np.float32, copy=True).reshape(n, 3)
+                _cur_qd = np.array(state_in.particle_qd.numpy(),
+                                   dtype=np.float32, copy=True).reshape(n, 3)
+                _cur_q [root_indices] += root_delta_per_substep
+                _cur_qd[root_indices]  = root_vel
+                wp.copy(state_in.particle_q,
+                        wp.from_numpy(np.ascontiguousarray(_cur_q,  dtype=np.float32),
+                                      dtype=wp.vec3, device=device))
+                wp.copy(state_in.particle_qd,
+                        wp.from_numpy(np.ascontiguousarray(_cur_qd, dtype=np.float32),
+                                      dtype=wp.vec3, device=device))
+
                 if BODY_COLLISION_ENABLED and self._vbd_contacts is not None:
                     self._vbd_model.collide(state_in, self._vbd_contacts)
                 self._vbd_solver.step(
@@ -813,7 +877,14 @@ class WorldPassthrough:
             print(f"[hair_sim/vbd] step failed (suppressing): {exc!r}")
             return False
 
-        # 5. Writeback with modifier-offset compensation:
+        # 5. Writeback with modifier-offset compensation. RESTORED in
+        #    v0.0.54 after Trial 7 (v0.0.53) confirmed this is the
+        #    correct SIM output (user-validated as image #19, the
+        #    sea-urchin pose = actual VBD physics result). The PLAYBACK
+        #    path also gets the same compensation applied (see
+        #    _restore_from_bake) so the two modes now write identical
+        #    bytes — fixing the v0.0.50-era consistency bug where SIM
+        #    and PLAYBACK rendered different visuals at the same frame.
         #    target_eval = vbd_out, modifier(written) = written + offset,
         #    so write = vbd_out - offset → modifier produces vbd_out.
         write_world = vbd_out - offset_world

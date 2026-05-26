@@ -27,6 +27,29 @@ class HAIR_SIM_PT_main(Panel):
         row.operator("hair_sim.stop",   text="Stop",   icon="PAUSE",        depress=(mode == "PLAYBACK"))
         row.operator("hair_sim.bypass", text="Bypass", icon="FILE_REFRESH", depress=(mode == "BYPASS"))
 
+        # ---- Research parameter panel (REMOVE FOR PRODUCTION) ----
+        # Applied at next Start (Stop → change → Start). Editing during
+        # SIMULATING does nothing until restart.
+        box = layout.box()
+        box.label(text="Params (research, applied at next Start)")
+        param_attrs = (
+            "hair_sim_param_vbd_spring_ke",
+            "hair_sim_param_vbd_spring_kd",
+            "hair_sim_param_vbd_free_particle_mass",
+            "hair_sim_param_vbd_gravity",
+            "hair_sim_param_vbd_iterations",
+            "hair_sim_param_vbd_substeps",
+            "hair_sim_param_vbd_bending_enabled",
+            "hair_sim_param_vbd_bending_ke",
+            "hair_sim_param_vbd_bending_kd",
+            "hair_sim_param_vbd_self_contact_enabled",
+            "hair_sim_param_body_collision_enabled",
+            "hair_sim_param_body_collision_target",
+        )
+        for attr in param_attrs:
+            if hasattr(wm, attr):
+                box.prop(wm, attr)
+
 
 _classes = (HAIR_SIM_PT_main,)
 

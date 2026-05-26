@@ -1,0 +1,14 @@
+{
+    "VBD_SPRING_KE":             1.0e8,
+    "VBD_SPRING_KD":             1.0,
+    "VBD_FREE_PARTICLE_MASS":    1.0,
+    "VBD_GRAVITY":               -9.81,
+    "VBD_ITERATIONS":            100,
+    "VBD_SUBSTEPS":              4,
+    "VBD_BENDING_ENABLED":       true,
+    "VBD_BENDING_KE":            100.0,
+    "VBD_BENDING_KD":            1.0,
+    "VBD_SELF_CONTACT_ENABLED":  false,
+    "BODY_COLLISION_ENABLED":    true,
+    "BODY_COLLISION_TARGET":     "CC_Base_Body"
+}
