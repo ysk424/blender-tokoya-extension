@@ -8,7 +8,6 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, WindowManager
-from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import ui
 
@@ -180,19 +179,21 @@ def _snapshot_params(wm: bpy.types.WindowManager) -> None:
 # Save / Load preset operators
 # ---------------------------------------------------------------------------
 
-class HAIR_SIM_OT_save_params(Operator, ExportHelper):
+class HAIR_SIM_OT_save_params(Operator):
     bl_idname    = "hair_sim.save_params"
     bl_label     = "Save Params"
-    bl_description = "Save current physics parameters to a JSON preset file"
-    filename_ext = ".json"
-    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    bl_description = "Save current parameters to a JSON preset file"
+    filepath: StringProperty(subtype="FILE_PATH", default="katsura_params.json")
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
         out: dict = {}
         for key in _PARAM_FLOAT_KEYS:
-            disp = getattr(wm, _wm_attr(key))
-            out[key] = _display_to_physics(key, disp)
+            out[key] = _display_to_physics(key, getattr(wm, _wm_attr(key)))
         for key in _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS:
             out[key] = getattr(wm, _wm_attr(key))
         try:
@@ -205,11 +206,16 @@ class HAIR_SIM_OT_save_params(Operator, ExportHelper):
         return {"FINISHED"}
 
 
-class HAIR_SIM_OT_load_params(Operator, ImportHelper):
+class HAIR_SIM_OT_load_params(Operator):
     bl_idname    = "hair_sim.load_params"
     bl_label     = "Load Params"
-    bl_description = "Load physics parameters from a JSON preset file"
+    bl_description = "Load parameters from a JSON preset file"
+    filepath: StringProperty(subtype="FILE_PATH")
     filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         try:
@@ -224,12 +230,11 @@ class HAIR_SIM_OT_load_params(Operator, ImportHelper):
             attr = _wm_attr(key)
             if not hasattr(wm, attr):
                 continue
-            if key in _PARAM_FLOAT_KEYS:
-                setattr(wm, attr, _physics_to_display(key, phys_val))
-            else:
-                setattr(wm, attr, phys_val)
+            setattr(wm, attr,
+                    _physics_to_display(key, phys_val) if key in _PARAM_FLOAT_KEYS
+                    else phys_val)
             loaded.append(key)
-        self.report({"INFO"}, f"Loaded {len(loaded)} params from {os.path.basename(self.filepath)}")
+        self.report({"INFO"}, f"Loaded {len(loaded)} params")
         return {"FINISHED"}
 
 

@@ -44,7 +44,7 @@ class HAIR_SIM_PT_main(Panel):
         except Exception:
             version = "?"
         row = layout.row()
-        row.label(text=f"Katsura v{version}", icon="HAIR")
+        row.label(text=f"Katsura  v{version}")
 
         # ---- Mode buttons ----
         row = layout.row(align=True)
@@ -67,7 +67,7 @@ class HAIR_SIM_PT_main(Panel):
 
         # ---- Dynamics ----
         box = layout.box()
-        box.label(text="Dynamics", icon="FORCE_GRAVITY")
+        box.label(text="Dynamics")
         col = box.column(align=True)
         for key in ("SPRING_KE", "DAMPING", "PARTICLE_MASS", "GRAVITY"):
             attr = "hair_sim_param_" + key.lower()
@@ -83,7 +83,7 @@ class HAIR_SIM_PT_main(Panel):
 
         # ---- Solver ----
         box = layout.box()
-        box.label(text="Solver", icon="MOD_PHYSICS")
+        box.label(text="Solver")
         col = box.column(align=True)
         for key in ("ITERATIONS", "SUBSTEPS"):
             attr = "hair_sim_param_" + key.lower()
