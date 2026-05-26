@@ -199,6 +199,12 @@ class WorldPassthrough:
         self._vbd_device        = None
         self._vbd_module_warp   = None  # cached `import warp` handle
 
+        # Body collision: id of the body-mesh shape inside the solver
+        # model, and vertex count at Start. Per-frame vertex updates
+        # use these to locate the warp Mesh and validate topology.
+        self._collider_shape_id     = None
+        self._body_collider_n_verts = 0
+
         # Per-call telemetry.
         self._step_count        = 0
 
@@ -452,12 +458,67 @@ class WorldPassthrough:
             print(f"[hair_sim/vbd] body collision build failed: {exc!r}")
             return False
 
+        # Remember shape id + initial vertex count so per-frame vertex
+        # updates can locate the warp Mesh in the finalized model and
+        # validate topology hasn't changed.
+        self._collider_shape_id     = collider_shape_id
+        self._body_collider_n_verts = n_v
+
         print(
             f"[hair_sim/vbd] body collision: "
             f"target={BODY_COLLISION_TARGET!r}, n_verts={n_v}, n_tris={n_t}, "
             f"shape_id={collider_shape_id}, body_id={collider_body_id} "
-            f"(static / one-time bake at Start)"
+            f"(per-frame vertex update enabled)"
         )
+        return True
+
+    def _update_body_collider_vertices(self) -> bool:
+        """Per-frame body-mesh refresh: re-read evaluated body mesh,
+        push new world-space vertex positions into the warp Mesh's
+        `points` buffer in-place, and refit BVH so subsequent
+        model.collide() sees the current geometry.
+
+        Topology unchanged is assumed; silent no-op on vertex-count
+        mismatch (the static initial mesh from Start remains valid)."""
+        if self._collider_shape_id is None or self._vbd_model is None:
+            return False
+        wp = self._vbd_module_warp
+        if wp is None:
+            return False
+
+        body_obj = bpy.data.objects.get(BODY_COLLISION_TARGET)
+        if body_obj is None or body_obj.type != 'MESH':
+            return False
+
+        dg = bpy.context.evaluated_depsgraph_get()
+        body_eval = body_obj.evaluated_get(dg)
+        body_data = body_eval.data
+
+        n_v = len(body_data.vertices)
+        if n_v != self._body_collider_n_verts:
+            return False
+
+        v_flat = np.zeros(n_v * 3, dtype=np.float32)
+        body_data.vertices.foreach_get("co", v_flat)
+        v_local = v_flat.reshape(n_v, 3)
+        body_mw = np.array(body_obj.matrix_world, dtype=np.float32)
+        v_h = np.column_stack([v_local, np.ones(n_v, dtype=np.float32)])
+        v_world = (v_h @ body_mw.T)[:, :3].astype(np.float32, copy=True)
+
+        try:
+            # After finalize(), `model.shape_source[shape_id]` is the
+            # newton.Mesh we passed; its `.mesh` attribute is the
+            # underlying wp.Mesh with mutable `.points` + `refit()`.
+            newton_mesh = self._vbd_model.shape_source[self._collider_shape_id]
+            warp_mesh = newton_mesh.mesh
+            new_points = wp.from_numpy(
+                v_world, dtype=wp.vec3, device=warp_mesh.device,
+            )
+            wp.copy(warp_mesh.points, new_points)
+            warp_mesh.refit()
+        except Exception as exc:
+            print(f"[hair_sim/vbd] body collider vertex update failed (suppressing): {exc!r}")
+            return False
         return True
 
     def _ensure_vbd_initialized(self) -> bool:
@@ -658,10 +719,10 @@ class WorldPassthrough:
             wp.copy(self._vbd_state_in.particle_q,  tmp_q)
             wp.copy(self._vbd_state_in.particle_qd, tmp_qd)
 
-            # 3a. Run collision detection (body collision only). Newton's
-            #     SolverVBD step does NOT call collide() itself; it
-            #     consumes the populated contacts.soft_contact_* arrays.
+            # 3a. Refresh body-collision mesh to track body skinning
+            #     at this frame, then run collision detection.
             if BODY_COLLISION_ENABLED and self._vbd_contacts is not None:
+                self._update_body_collider_vertices()
                 self._vbd_model.collide(
                     self._vbd_state_in,
                     self._vbd_contacts,
@@ -801,6 +862,8 @@ class WorldPassthrough:
         self._vbd_state_out = None
         self._vbd_control   = None
         self._vbd_contacts  = None
+        self._collider_shape_id     = None
+        self._body_collider_n_verts = 0
 
         # Allocate (or reuse) the RAM bake. Clears mask either way.
         self._allocate_bake(scene)
@@ -843,6 +906,8 @@ class WorldPassthrough:
         self._vbd_contacts      = None
         self._vbd_device        = None
         self._vbd_module_warp   = None
+        self._collider_shape_id     = None
+        self._body_collider_n_verts = 0
         self._initialized       = False
         self._step_error_active = False
 
