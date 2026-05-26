@@ -1,24 +1,20 @@
 """Taichi XPBD solver for hair simulation.
 
-Usage:
-    cls = get_solver_class()        # lazy ti.init()
-    solver = cls(n_total, n_strands, pps, init_positions, ...)
-    solver.set_positions_velocities(pos_np, vel_np)
-    pos_out = solver.run_frame(dt, n_substeps, n_iter, gravity,
-                               new_root_world, seg_ke, bend_ke,
-                               damping, bending_enabled)
-    vel_out = solver.get_velocities_numpy()
+Design choice: all @ti.kernel methods use SCALAR arguments only
+(int, float / ti.f32 etc.).  ndarray inputs go through ti.field.from_numpy()
+before the kernel, outputs come back via ti.field.to_numpy() after.
+This avoids a Python-3.13 + Taichi-1.7.4 incompatibility where
+ndarray / ti.template() annotations inside @ti.data_oriented class
+kernels raise TaichiSyntaxError.
 """
-from __future__ import annotations
-
 import sys
 import site
 import numpy as np
 
 _PYTHON_USER_SITE = r"C:\Users\azoo\AppData\Roaming\Python\Python313\site-packages"
 
-_ti              = None   # cached taichi module
-_SolverClass     = None   # cached @ti.data_oriented class
+_ti          = None
+_SolverClass = None
 
 
 def _ensure_taichi():
@@ -40,8 +36,7 @@ def _ensure_taichi():
 
 
 def get_solver_class():
-    """Return (creating if needed) the TaichiXPBDSolver class.
-    Must be called after Taichi is importable."""
+    """Return (creating if needed) the TaichiXPBDSolver class."""
     global _SolverClass
     if _SolverClass is not None:
         return _SolverClass
@@ -50,33 +45,44 @@ def get_solver_class():
 
     @ti.data_oriented
     class TaichiXPBDSolver:
-        """XPBD strand solver. All coordinates in world space."""
+        """XPBD strand solver. All coordinates in world space (metres).
+
+        All kernels use only scalar arguments (int / ti.f32 etc.).
+        ndarray I/O goes through .from_numpy() / .to_numpy() in
+        Python-side helper methods.
+        """
 
         def __init__(
             self,
-            n_total:        int,
-            n_strands:      int,
-            pps:            int,            # points per strand
-            init_pos:       np.ndarray,     # (n_total, 3) float32 world
-            particle_mass:  float,
+            n_total:         int,
+            n_strands:       int,
+            pps:             int,           # points per strand
+            init_pos:        np.ndarray,    # (n_total, 3) float32 world
+            particle_mass:   float,
             bending_enabled: bool,
         ):
             self.n_total   = n_total
             self.n_strands = n_strands
             self.pps       = pps
 
+            # Main simulation fields
             self.pos       = ti.Vector.field(3, dtype=ti.f32, shape=n_total)
             self.vel       = ti.Vector.field(3, dtype=ti.f32, shape=n_total)
             self.pos_pred  = ti.Vector.field(3, dtype=ti.f32, shape=n_total)
             self.inv_mass  = ti.field(dtype=ti.f32, shape=n_total)
+
+            # Rest-length tables
             self.seg_rest  = ti.field(dtype=ti.f32, shape=(n_strands, pps - 1))
-            # bend_rest allocated even when disabled (dummy shape prevents
-            # out-of-bounds in the kernel; just unused)
-            bend_shape = (n_strands, max(pps - 2, 1))
+            bend_shape     = (n_strands, max(pps - 2, 1))
             self.bend_rest = ti.field(dtype=ti.f32, shape=bend_shape)
+
+            # Root positions written by Python before each substep
+            self.roots     = ti.Vector.field(3, dtype=ti.f32, shape=n_strands)
 
             self._setup(init_pos, particle_mass, bending_enabled)
 
+        # ------------------------------------------------------------------ #
+        # Initialisation
         # ------------------------------------------------------------------ #
 
         def _setup(self, init_pos: np.ndarray, particle_mass: float, bending_enabled: bool):
@@ -91,6 +97,7 @@ def get_solver_class():
             inv_m[np.arange(ns, dtype=np.int32) * pps] = 0.0   # roots kinematic
             self.inv_mass.from_numpy(inv_m)
 
+            # Segment rest lengths
             sr = np.zeros((ns, pps - 1), dtype=np.float32)
             for s in range(ns):
                 b = s * pps
@@ -98,6 +105,7 @@ def get_solver_class():
                     sr[s, k] = max(float(np.linalg.norm(pos_f[b+k] - pos_f[b+k+1])), 1e-6)
             self.seg_rest.from_numpy(sr)
 
+            # Bending rest lengths
             if bending_enabled and pps >= 3:
                 br = np.zeros((ns, pps - 2), dtype=np.float32)
                 for s in range(ns):
@@ -106,54 +114,43 @@ def get_solver_class():
                         br[s, k] = max(float(np.linalg.norm(pos_f[b+k] - pos_f[b+k+2])), 1e-6)
                 self.bend_rest.from_numpy(br)
 
-        # ------------------------------------------------------------------ #
-        # Upload / download
-        # ------------------------------------------------------------------ #
-
-        def set_positions_velocities(self, pos_np: np.ndarray, vel_np: np.ndarray):
-            self.pos.from_numpy(np.ascontiguousarray(pos_np, dtype=np.float32))
-            self.vel.from_numpy(np.ascontiguousarray(vel_np, dtype=np.float32))
-
-        def get_positions_numpy(self) -> np.ndarray:
-            return self.pos.to_numpy()
-
-        def get_velocities_numpy(self) -> np.ndarray:
-            return self.vel.to_numpy()
+            # Initialise roots field from init_pos
+            root_np = np.ascontiguousarray(pos_f[np.arange(ns)*pps], dtype=np.float32)
+            self.roots.from_numpy(root_np)
 
         # ------------------------------------------------------------------ #
-        # Kernels
+        # Kernels — scalar arguments only
         # ------------------------------------------------------------------ #
-
-        @ti.kernel
-        def _set_roots(self, roots: ti.types.ndarray(ndim=2)):
-            """roots: (n_strands, 3) float32 — new world positions for root particles."""
-            for s in range(self.n_strands):
-                i = s * self.pps
-                p = ti.Vector([roots[s, 0], roots[s, 1], roots[s, 2]])
-                self.pos[i]      = p
-                self.pos_pred[i] = p
 
         @ti.kernel
         def _predict(self, dt: ti.f32, gravity: ti.f32):
+            """Apply gravity, advance free particles; set kinematic roots."""
             for i in range(self.n_total):
-                if self.inv_mass[i] > 0.0:
-                    self.vel[i][2] += gravity * dt
-                    self.pos_pred[i] = self.pos[i] + self.vel[i] * dt
-                # kinematic roots: already set by _set_roots
+                s = i // self.pps
+                k = i %  self.pps
+                if k == 0:
+                    # Kinematic root: set to pre-uploaded roots field
+                    self.pos[i]      = self.roots[s]
+                    self.pos_pred[i] = self.roots[s]
+                else:
+                    self.vel[i][2]   += gravity * dt
+                    self.pos_pred[i]  = self.pos[i] + self.vel[i] * dt
 
         @ti.kernel
         def _solve_springs(
-            self, dt: ti.f32,
-            seg_ke: ti.f32, bend_ke: ti.f32,
-            do_bend: int,
+            self,
+            dt: ti.f32, seg_ke: ti.f32,
+            bend_ke: ti.f32, do_bend: int,
         ):
-            for s in range(self.n_strands):   # ← parallel over strands
+            """XPBD distance constraints — parallel over strands,
+            sequential within each strand (Gauss-Seidel)."""
+            for s in range(self.n_strands):   # parallel
                 base = s * self.pps
 
-                # Segment springs (i, i+1) — sequential within strand
+                # Segment springs (i, i+1)
                 for k in range(self.pps - 1):
-                    i = base + k
-                    j = base + k + 1
+                    i  = base + k
+                    j  = base + k + 1
                     wi = self.inv_mass[i]
                     wj = self.inv_mass[j]
                     if wi + wj > 1e-10:
@@ -170,8 +167,8 @@ def get_solver_class():
                 # Bending springs (i, i+2)
                 if do_bend == 1:
                     for k in range(self.pps - 2):
-                        i = base + k
-                        j = base + k + 2
+                        i  = base + k
+                        j  = base + k + 2
                         wi = self.inv_mass[i]
                         wj = self.inv_mass[j]
                         if wi + wj > 1e-10:
@@ -187,16 +184,29 @@ def get_solver_class():
 
         @ti.kernel
         def _update_vel_pos(self, dt: ti.f32, damping: ti.f32):
+            """Derive velocity from position change, apply damping, advance pos."""
             for i in range(self.n_total):
                 if self.inv_mass[i] > 0.0:
                     self.vel[i] = (self.pos_pred[i] - self.pos[i]) / dt * (1.0 - damping)
                     self.pos[i] = self.pos_pred[i]
 
-        @ti.kernel
-        def _upload_pos(self, positions: ti.types.ndarray(ndim=2)):
-            """Push corrected positions (e.g. after body collision) back into pos."""
-            for i in range(self.n_total):
-                self.pos[i] = ti.Vector([positions[i, 0], positions[i, 1], positions[i, 2]])
+        # ------------------------------------------------------------------ #
+        # Python-side upload / download
+        # ------------------------------------------------------------------ #
+
+        def set_positions_velocities(self, pos_np: np.ndarray, vel_np: np.ndarray):
+            self.pos.from_numpy(np.ascontiguousarray(pos_np, dtype=np.float32))
+            self.vel.from_numpy(np.ascontiguousarray(vel_np, dtype=np.float32))
+
+        def upload_corrected_positions(self, pos_np: np.ndarray):
+            """After body collision, sync corrected positions back to GPU."""
+            self.pos.from_numpy(np.ascontiguousarray(pos_np, dtype=np.float32))
+
+        def get_positions_numpy(self) -> np.ndarray:
+            return self.pos.to_numpy()
+
+        def get_velocities_numpy(self) -> np.ndarray:
+            return self.vel.to_numpy()
 
         # ------------------------------------------------------------------ #
         # High-level entry point
@@ -208,7 +218,7 @@ def get_solver_class():
             n_substeps:      int,
             n_iter:          int,
             gravity:         float,
-            new_root_world:  np.ndarray,   # (n_strands, 3)
+            new_root_world:  np.ndarray,    # (n_strands, 3)
             seg_ke:          float,
             bend_ke:         float,
             damping:         float,
@@ -220,10 +230,12 @@ def get_solver_class():
             do_bend  = int(bending_enabled)
 
             for _ in range(n_substeps):
-                self._set_roots(roots_np)
+                # Upload root positions to GPU field (no kernel needed)
+                self.roots.from_numpy(roots_np)
                 self._predict(dt_sub, float(gravity))
                 for _ in range(n_iter):
-                    self._solve_springs(dt_sub, float(seg_ke), float(bend_ke), do_bend)
+                    self._solve_springs(dt_sub, float(seg_ke),
+                                        float(bend_ke), do_bend)
                 self._update_vel_pos(dt_sub, float(damping))
 
             return self.pos.to_numpy()
@@ -248,18 +260,14 @@ def build_body_bvh(body_name: str):
 
 
 def apply_body_collision(positions: np.ndarray, bvh, margin: float = 0.003) -> None:
-    """Push hair particles out of body mesh. Modifies positions in-place.
-
-    Uses BVHTree.find_nearest: if a particle is closer than `margin` to the
-    surface (measured along the face normal), it is pushed outward.
-    """
+    """Push hair particles out of body mesh. Modifies positions in-place."""
     from mathutils import Vector
     for i in range(len(positions)):
-        pt       = Vector(positions[i])
+        pt             = Vector(positions[i])
         loc, normal, _, _ = bvh.find_nearest(pt)
         if loc is None or normal is None:
             continue
-        depth = (pt - loc).dot(normal)   # >0 outside, <0 inside
+        depth = (pt - loc).dot(normal)   # >0 = outside, <0 = inside
         if depth < margin:
             c = normal * (margin - depth)
             positions[i, 0] += c.x

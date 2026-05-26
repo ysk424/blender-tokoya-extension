@@ -321,9 +321,7 @@ class WorldPassthrough:
                 if bvh is not None:
                     _sim_taichi.apply_body_collision(sim_out, bvh)
                     # Sync corrected positions back to solver for next frame's vel.
-                    self._taichi_solver._upload_pos(
-                        np.ascontiguousarray(sim_out, dtype=np.float32)
-                    )
+                    self._taichi_solver.upload_corrected_positions(sim_out)
             except Exception as exc:
                 print(f"[hair_sim/taichi] body collision error (suppressed): {exc!r}")
 
