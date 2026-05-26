@@ -58,33 +58,33 @@ def _display_to_physics(key: str, disp) -> float:
 # Float property specs: (name, description, min, max, soft_min, soft_max, step, precision)
 _FLOAT_SPECS: dict[str, dict] = {
     "SPRING_KE": dict(
-        name        = "Segment Stiffness (10^N)",
-        description = "log₁₀ of segment spring stiffness. 4.0 → 10,000",
+        name        = "Stiffness 10^N",
+        description = "log10 segment spring stiffness. 4.0 → 10,000",
         min=1.0, max=9.0, soft_min=2.0, soft_max=7.0, step=10, precision=2,
     ),
     "DAMPING": dict(
-        name        = "Damping (÷100)",
-        description = "Velocity damping per substep. Display ÷ 100 = actual. 1.0 → 0.01",
+        name        = "Damping /100",
+        description = "Velocity damping per substep. Display / 100 = actual. 1.0 → 0.01",
         min=0.0, max=50.0, soft_min=0.0, soft_max=20.0, step=10, precision=1,
     ),
     "PARTICLE_MASS": dict(
-        name        = "Particle Mass (÷1000)",
-        description = "Free particle mass. Display ÷ 1000 = actual kg. 1000 → 1.0 kg",
+        name        = "Mass /1000",
+        description = "Free particle mass. Display / 1000 = actual kg. 1000 → 1.0 kg",
         min=1.0, max=10000.0, soft_min=10.0, soft_max=5000.0, step=100, precision=1,
     ),
     "GRAVITY": dict(
-        name        = "Gravity (m/s²)",
+        name        = "Gravity m/s2",
         description = "Gravitational acceleration along -Z axis",
         min=-20.0, max=0.0, soft_min=-15.0, soft_max=0.0, step=10, precision=2,
     ),
     "ROOT_BENDING_KE": dict(
-        name        = "Root Stiffness (10^N)",
-        description = "log₁₀ of root bending stiffness (first 2 joints). 3.3 → 2,000",
+        name        = "Root Stiff 10^N",
+        description = "log10 root bending stiffness (first 2 joints). 3.3 → 2,000",
         min=0.0, max=7.0, soft_min=1.0, soft_max=5.0, step=10, precision=2,
     ),
     "BENDING_KE": dict(
-        name        = "Strand Stiffness (10^N)",
-        description = "log₁₀ of strand bending stiffness (remaining joints). 1.0 → 10",
+        name        = "Strand Stiff 10^N",
+        description = "log10 strand bending stiffness (remaining joints). 1.0 → 10",
         min=0.0, max=6.0, soft_min=0.0, soft_max=4.0, step=10, precision=2,
     ),
 }
@@ -130,9 +130,10 @@ def _register_param_props(defaults: dict) -> None:
             precision   = spec.get("precision", 3),
             options     = {"SKIP_SAVE"},
         ))
+    _int_labels = {"ITERATIONS": "Iterations", "SUBSTEPS": "Substeps"}
     for key in _PARAM_INT_KEYS:
         setattr(WindowManager, _wm_attr(key), IntProperty(
-            name    = key,
+            name    = _int_labels.get(key, key),
             default = int(defaults[key]),
             min     = 1,
             max     = 64,
