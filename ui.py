@@ -28,7 +28,7 @@ class HAIR_SIM_PT_main(Panel):
     bl_label       = "Katsura"
     bl_space_type  = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category    = "HairSim"
+    bl_category    = "Katsura"
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
@@ -37,8 +37,10 @@ class HAIR_SIM_PT_main(Panel):
 
         # ---- Header: name + version ----
         try:
-            from . import _get_version
-            version = _get_version()
+            import os, tomllib
+            path = os.path.join(os.path.dirname(__file__), "blender_manifest.toml")
+            with open(path, "rb") as _f:
+                version = tomllib.load(_f).get("version", "?")
         except Exception:
             version = "?"
         row = layout.row()

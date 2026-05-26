@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import tomllib
 
 import bpy
 from bpy.app.handlers import persistent
@@ -17,19 +16,6 @@ from . import ui
 MODE_BYPASS     = "BYPASS"
 MODE_SIMULATING = "SIMULATING"
 MODE_PLAYBACK   = "PLAYBACK"
-
-
-# ---------------------------------------------------------------------------
-# Version
-# ---------------------------------------------------------------------------
-
-def _get_version() -> str:
-    try:
-        path = os.path.join(os.path.dirname(__file__), "blender_manifest.toml")
-        with open(path, "rb") as f:
-            return tomllib.load(f).get("version", "?")
-    except Exception:
-        return "?"
 
 
 # ---------------------------------------------------------------------------
