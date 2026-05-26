@@ -1,13 +1,13 @@
 {
-    "SPRING_KE":             1.0e4,
-    "SPRING_KD":             0.01,
-    "PARTICLE_MASS":         1.0,
-    "GRAVITY":               -9.81,
-    "ITERATIONS":            10,
-    "SUBSTEPS":              4,
-    "BENDING_ENABLED":       true,
-    "BENDING_KE":            10.0,
-    "BENDING_KD":            0.01,
+    "SPRING_KE":          1.0e4,
+    "DAMPING":            0.01,
+    "PARTICLE_MASS":      1.0,
+    "GRAVITY":            -9.81,
+    "ITERATIONS":         10,
+    "SUBSTEPS":           4,
+    "BENDING_ENABLED":    true,
+    "ROOT_BENDING_KE":    2000.0,
+    "BENDING_KE":         10.0,
     "BODY_COLLISION_ENABLED": true,
     "BODY_COLLISION_TARGET":  "CC_Base_Body"
 }

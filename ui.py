@@ -27,21 +27,46 @@ class HAIR_SIM_PT_main(Panel):
         # ---- Simulation parameters (applied at next Start) ----
         box = layout.box()
         box.label(text="Params (applied at next Start)")
+
+        # Physics
+        col = box.column(align=True)
+        col.label(text="Physics:")
         for attr in (
             "hair_sim_param_spring_ke",
-            "hair_sim_param_spring_kd",
+            "hair_sim_param_damping",
             "hair_sim_param_particle_mass",
             "hair_sim_param_gravity",
-            "hair_sim_param_iterations",
-            "hair_sim_param_substeps",
-            "hair_sim_param_bending_enabled",
-            "hair_sim_param_bending_ke",
-            "hair_sim_param_bending_kd",
-            "hair_sim_param_body_collision_enabled",
-            "hair_sim_param_body_collision_target",
         ):
             if hasattr(wm, attr):
-                box.prop(wm, attr)
+                col.prop(wm, attr)
+
+        # Solver
+        col = box.column(align=True)
+        col.label(text="Solver:")
+        for attr in (
+            "hair_sim_param_iterations",
+            "hair_sim_param_substeps",
+        ):
+            if hasattr(wm, attr):
+                col.prop(wm, attr)
+
+        # Bending
+        col = box.column(align=True)
+        col.prop(wm, "hair_sim_param_bending_enabled")
+        if getattr(wm, "hair_sim_param_bending_enabled", False):
+            for attr in (
+                "hair_sim_param_root_bending_ke",
+                "hair_sim_param_bending_ke",
+            ):
+                if hasattr(wm, attr):
+                    col.prop(wm, attr)
+
+        # Collision
+        col = box.column(align=True)
+        col.prop(wm, "hair_sim_param_body_collision_enabled")
+        if getattr(wm, "hair_sim_param_body_collision_enabled", False):
+            if hasattr(wm, "hair_sim_param_body_collision_target"):
+                col.prop(wm, "hair_sim_param_body_collision_target")
 
 
 _classes = (HAIR_SIM_PT_main,)

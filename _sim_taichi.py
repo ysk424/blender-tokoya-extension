@@ -140,10 +140,16 @@ def get_solver_class():
         def _solve_springs(
             self,
             dt: ti.f32, seg_ke: ti.f32,
-            bend_ke: ti.f32, do_bend: int,
+            root_bend_ke: ti.f32, bend_ke: ti.f32,
+            do_bend: int,
         ):
             """XPBD distance constraints — parallel over strands,
-            sequential within each strand (Gauss-Seidel)."""
+            sequential within each strand (Gauss-Seidel).
+
+            Bending stiffness gradient: first 2 bending springs from root
+            use root_bend_ke (stiff → hair stands up from scalp);
+            remaining springs use bend_ke (soft → hair drapes naturally).
+            """
             for s in range(self.n_strands):   # parallel
                 base = s * self.pps
 
@@ -164,7 +170,7 @@ def get_solver_class():
                             self.pos_pred[i] += wi * dlam * grad
                             self.pos_pred[j] -= wj * dlam * grad
 
-                # Bending springs (i, i+2)
+                # Bending springs (i, i+2) with stiffness gradient
                 if do_bend == 1:
                     for k in range(self.pps - 2):
                         i  = base + k
@@ -175,8 +181,11 @@ def get_solver_class():
                             d    = self.pos_pred[i] - self.pos_pred[j]
                             dist = d.norm()
                             if dist > 1e-8:
+                                # Root area (k < 2): stiff → stands up from scalp
+                                # Distal area (k >= 2): soft → drapes naturally
+                                ke    = ti.select(k < 2, root_bend_ke, bend_ke)
                                 C     = dist - self.bend_rest[s, k]
-                                alpha = 1.0 / (bend_ke * dt * dt)
+                                alpha = 1.0 / (ke * dt * dt)
                                 dlam  = -C / (wi + wj + alpha)
                                 grad  = d / dist
                                 self.pos_pred[i] += wi * dlam * grad
@@ -225,6 +234,7 @@ def get_solver_class():
             gravity:         float,
             new_root_world:  np.ndarray,    # (n_strands, 3)
             seg_ke:          float,
+            root_bend_ke:    float,
             bend_ke:         float,
             damping:         float,
             bending_enabled: bool,
@@ -248,7 +258,8 @@ def get_solver_class():
                 self._predict(dt_sub, float(gravity))
                 for _ in range(n_iter):
                     self._solve_springs(dt_sub, float(seg_ke),
-                                        float(bend_ke), do_bend)
+                                        float(root_bend_ke), float(bend_ke),
+                                        do_bend)
                 # Body collision: modify pos_pred, then derive velocity normally.
                 if body_collision_fn is not None:
                     pred_np = self.pos_pred.to_numpy()

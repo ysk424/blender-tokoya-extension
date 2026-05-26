@@ -33,15 +33,15 @@ POINTS_PER_STRAND = 8    # Uniform — verified in Phase 3A scene investigation.
 _PYTHON_USER_SITE = r"C:\Users\azoo\AppData\Roaming\Python\Python313\site-packages"
 
 # ---- Simulation parameters (written from WM at each Start) ----
-SPRING_KE             = 1e4
-SPRING_KD             = 0.01
-PARTICLE_MASS         = 1.0
-GRAVITY               = -9.81
-ITERATIONS            = 10
-SUBSTEPS              = 4
-BENDING_ENABLED       = True
-BENDING_KE            = 10.0
-BENDING_KD            = 0.01
+SPRING_KE              = 1e4
+DAMPING                = 0.01
+PARTICLE_MASS          = 1.0
+GRAVITY                = -9.81
+ITERATIONS             = 10
+SUBSTEPS               = 4
+BENDING_ENABLED        = True
+ROOT_BENDING_KE        = 2000.0
+BENDING_KE             = 10.0
 BODY_COLLISION_ENABLED = True
 BODY_COLLISION_TARGET  = "CC_Base_Body"
 
@@ -327,8 +327,9 @@ class WorldPassthrough:
             gravity            = GRAVITY,
             new_root_world     = new_root_world,
             seg_ke             = SPRING_KE,
+            root_bend_ke       = ROOT_BENDING_KE,
             bend_ke            = BENDING_KE,
-            damping            = SPRING_KD,
+            damping            = DAMPING,
             bending_enabled    = BENDING_ENABLED,
             body_collision_fn  = body_collision_fn,
         )  # (n_total, 3) float32

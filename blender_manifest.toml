@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "hair_sim_physx"
-version = "0.0.57"
+version = "0.0.58"
 name = "Katsura"
-tagline = "Hair simulation skeleton (Phase 1)"
+tagline = "Hair physics simulation — Taichi XPBD"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
 type = "add-on"
 
@@ -19,14 +19,7 @@ platforms = ["windows-x64"]
 paths = [
     "__init__.py",
     "ui.py",
-    "_native_loader.py",
-    "_warp_kernels.py",
     "_world_passthrough.py",
     "_sim_taichi.py",
     "hair_sim_defaults.json",
-    "native/phase2b_probe.cp313-win_amd64.pyd",
-    "native/PhysX_64.dll",
-    "native/PhysXCommon_64.dll",
-    "native/PhysXFoundation_64.dll",
-    "native/PhysXCooking_64.dll",
 ]

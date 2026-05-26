@@ -18,19 +18,17 @@ MODE_PLAYBACK   = "PLAYBACK"
 
 # ---------------------------------------------------------------------------
 # Simulation parameter panel.
-#
-# Defaults live in hair_sim_defaults.json. Values are snapshotted into
-# _world_passthrough module constants at each Start, so Stop → change → Start
-# picks them up. ABEND if JSON is missing or has missing keys.
+# Defaults from hair_sim_defaults.json. Values snapshotted into
+# _world_passthrough module constants at each Start.
 # ---------------------------------------------------------------------------
 
 _PARAM_FLOAT_KEYS = (
     "SPRING_KE",
-    "SPRING_KD",
+    "DAMPING",
     "PARTICLE_MASS",
     "GRAVITY",
+    "ROOT_BENDING_KE",
     "BENDING_KE",
-    "BENDING_KD",
 )
 _PARAM_INT_KEYS = (
     "ITERATIONS",
