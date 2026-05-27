@@ -166,17 +166,23 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
         if total < 1e-6:
             continue
 
-        hit_arc = None
+        # Collect ALL intersections across every segment, then take the
+        # minimum arc-distance from root.  This handles closed meshes (sphere,
+        # capsule, etc.) where the strand crosses the surface TWICE: we always
+        # want the intersection NEAREST to the root (shorter side).
+        all_hits = []
         for seg in range(_PPC - 1):
             p0 = Vector(world[b + seg    ].tolist())
             p1 = Vector(world[b + seg + 1].tolist())
             dist, _ = _ray_cast_bidir(bvh, p0, p1)
             if dist is not None:
-                hit_arc = arcs[seg] + dist
-                break
+                all_hits.append(arcs[seg] + dist)
 
-        if hit_arc is None or hit_arc >= total:
-            continue  # strand never exits mesh, or tip already inside
+        if not all_hits:
+            continue  # no intersection at all
+        hit_arc = min(all_hits)   # ← shortest arc from root = cut point
+        if hit_arc >= total:
+            continue  # intersection is beyond tip — nothing to cut
 
         scale = hit_arc / total
         root  = local[b].copy()
