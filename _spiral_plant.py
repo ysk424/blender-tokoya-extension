@@ -187,7 +187,16 @@ def plant_hair(empty_obj: bpy.types.Object, alpha_cm: float, beta_cm: float) -> 
     curves_data.add_curves([PPC] * N)
 
     pos_attr    = curves_data.attributes["position"]
-    uv_attr     = curves_data.attributes["surface_uv_coordinate"]
+
+    # surface_uv_coordinate is auto-created by the sculpt brush but absent on
+    # programmatically-built (empty) Curves objects — create it if missing.
+    if "surface_uv_coordinate" not in curves_data.attributes:
+        curves_data.attributes.new(
+            name   = "surface_uv_coordinate",
+            type   = "FLOAT2",
+            domain = "CURVE",
+        )
+    uv_attr = curves_data.attributes["surface_uv_coordinate"]
     obj_winv    = curves_obj.matrix_world.inverted()
     obj_3x3_inv = curves_obj.matrix_world.to_3x3().inverted()
 
