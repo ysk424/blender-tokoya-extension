@@ -31,34 +31,34 @@ class TOKOYA_PT_main(Panel):
 
         # Plant parameters
         box = layout.box()
-        box.label(text="Plant")
+        box.label(text="Mask Plant")
         col = box.column(align=True)
-        col.prop(wm, "tokoya_alpha")
-        col.prop(wm, "tokoya_beta")
+        col.operator("tokoya.create_head_mask", icon="MESH_DATA")
+        col.prop(wm, "tokoya_strand_count")
+        col.prop(wm, "tokoya_max_length_cm")
 
-        # General N + Ref Object
+        # Persistent body and temporary cutter targets
         box = layout.box()
-        box.label(text="N  /  Ref Object")
+        box.label(text="Meshes")
         col = box.column(align=True)
-        col.prop(wm, "tokoya_n")
-
-        # Ref Object row: [name field] [eyedropper←active] [type label]
         row = col.row(align=True)
-        row.prop(wm, "tokoya_ref_obj", text="")
-        row.operator("tokoya.pick_ref", text="", icon="EYEDROPPER")
-        ref = bpy.data.objects.get(wm.tokoya_ref_obj.strip())
-        row.label(text=ref.type if ref else "--")
+        row.prop(wm, "tokoya_body_obj", text="Body")
+        row.operator("tokoya.pick_body", text="", icon="EYEDROPPER")
+        row = col.row(align=True)
+        row.prop(wm, "tokoya_cutter_obj", text="Cutter")
+        row.operator("tokoya.pick_cutter", text="", icon="EYEDROPPER")
+        col.prop(wm, "tokoya_simulation_steps")
+        col.prop(wm, "tokoya_compute_backend")
 
         layout.separator(factor=0.3)
 
         # Main buttons
         col = layout.column(align=True)
         col.operator("tokoya.plant_hair",  icon="OUTLINER_OB_CURVES")
-        col.operator("tokoya.extend",       icon="ARROW_LEFTRIGHT")
+        col.operator("tokoya.hair_remove",  icon="TRASH")
         col.operator("tokoya.simulate",     icon="PLAY")
         col.separator()
         col.operator("tokoya.mesh_shrink",  icon="MOD_SOLIDIFY")
-        col.operator("tokoya.mesh_extend",  icon="MESH_UVSPHERE")
         col.separator()
         col.operator("tokoya.urchin_reset", icon="FORCE_FORCE")
 

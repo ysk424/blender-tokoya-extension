@@ -1,7 +1,9 @@
 from __future__ import annotations
 import json, math, os
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import (
+    BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty,
+)
 from bpy.types import Operator, WindowManager
 from . import ui
 
@@ -23,6 +25,7 @@ def _snapshot_sim_params(wm):
     _wp.BENDING_ENABLED = wm.tokoya_bending_enabled
     _wp.ROOT_BENDING_KE = 10.0 ** wm.tokoya_root_bending_ke
     _wp.BENDING_KE      = 10.0 ** wm.tokoya_bending_ke
+    _wp.COMPUTE_BACKEND = wm.tokoya_compute_backend
 
 
 def _find_curves_obj():
@@ -30,44 +33,91 @@ def _find_curves_obj():
     return objs[0] if len(objs) == 1 else None
 
 
-class TOKOYA_OT_plant_hair(Operator):
-    bl_idname      = "tokoya.plant_hair"
-    bl_label       = "Plant Hair"
-    bl_description = "Plant strands via Vogel spiral seeded from Ref Object (Empty)"
+class TOKOYA_OT_create_head_mask(Operator):
+    bl_idname = "tokoya.create_head_mask"
+    bl_label = "Create Head Mask"
+    bl_description = "Create a white scale-1 paint mesh from the Curves surface"
 
     def execute(self, context):
-        wm       = context.window_manager
-        ref_name = wm.tokoya_ref_obj.strip()
-        if not ref_name:
-            self.report({"ERROR"}, "Ref Object is empty"); return {"CANCELLED"}
-        ref_obj = bpy.data.objects.get(ref_name)
-        if ref_obj is None:
-            self.report({"ERROR"}, f"Object {ref_name!r} not found"); return {"CANCELLED"}
-        if ref_obj.type != "EMPTY":
-            self.report({"WARNING"}, f"{ref_name!r} is {ref_obj.type}, not EMPTY")
-        from . import _spiral_plant
+        curves_obj = _find_curves_obj()
+        if curves_obj is None:
+            self.report({"ERROR"}, "Need exactly one Curves object")
+            return {"CANCELLED"}
+        body_name = context.window_manager.tokoya_body_obj.strip()
+        surface = bpy.data.objects.get(body_name)
+        if surface is None or surface.type != "MESH":
+            self.report({"ERROR"}, "Select a Body Mesh first")
+            return {"CANCELLED"}
+        curves_obj.data.surface = surface
+        if not curves_obj.data.surface_uv_map and surface.data.uv_layers.active:
+            curves_obj.data.surface_uv_map = surface.data.uv_layers.active.name
+
+        from . import _mask_plant
         try:
-            r = _spiral_plant.plant_hair(ref_obj, alpha_cm=wm.tokoya_alpha, beta_cm=wm.tokoya_beta)
-        except (ValueError, RuntimeError) as exc:
-            self.report({"ERROR"}, str(exc)); return {"CANCELLED"}
-        self.report({"INFO"},
-            f"Planted {r['n_added']} strands (total {r['total_curves']}). "
-            f"Root-surface max {r['root_to_surface_max_um']:.1f} um")
+            mask_obj = _mask_plant.create_head_mask(surface)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        mask_obj.select_set(True)
+        context.view_layer.objects.active = mask_obj
+        try:
+            bpy.ops.object.mode_set(mode="TEXTURE_PAINT")
+            paint = context.scene.tool_settings.image_paint
+            if paint.brush is not None and hasattr(paint.brush, "color"):
+                paint.brush.color = (0.0, 0.0, 0.0)
+        except RuntimeError:
+            pass
+
+        self.report(
+            {"INFO"},
+            "Created Tokoya_HairMask: white=0 cm, black=max length",
+        )
         return {"FINISHED"}
 
 
-class TOKOYA_OT_extend(Operator):
-    bl_idname      = "tokoya.extend"
-    bl_label       = "Extend"
-    bl_description = "Scale all strands from root to N cm (N = number field)"
+class TOKOYA_OT_plant_hair(Operator):
+    bl_idname      = "tokoya.plant_hair"
+    bl_label       = "Plant Hair"
+    bl_description = "Plant strands from the grayscale texture on Ref Object (Mesh)"
+
+    def execute(self, context):
+        wm       = context.window_manager
+        ref_obj = bpy.data.objects.get("Tokoya_HairMask")
+        if ref_obj is None:
+            self.report({"ERROR"}, "Create Tokoya_HairMask first"); return {"CANCELLED"}
+        if ref_obj.type != "MESH":
+            self.report({"ERROR"}, "Tokoya_HairMask must be a painted MESH")
+            return {"CANCELLED"}
+        from . import _mask_plant
+        try:
+            r = _mask_plant.plant_mask_hair(
+                ref_obj,
+                strand_count=wm.tokoya_strand_count,
+                max_length_cm=wm.tokoya_max_length_cm,
+            )
+        except (ValueError, RuntimeError) as exc:
+            self.report({"ERROR"}, str(exc)); return {"CANCELLED"}
+        self.report({"INFO"},
+            f"Planted {r['n_added']} strands / {r['total_points']} points. "
+            f"Mean length {r['mean_length_cm']:.1f} cm")
+        return {"FINISHED"}
+
+
+class TOKOYA_OT_hair_remove(Operator):
+    bl_idname = "tokoya.hair_remove"
+    bl_label = "Hair Remove"
+    bl_description = "Remove all strands while preserving the Curves object and surface setup"
 
     def execute(self, context):
         obj = _find_curves_obj()
         if obj is None:
             self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
-        from . import _mesh_ops
-        n = _mesh_ops.extend_length(obj, target_m=context.window_manager.tokoya_n / 100.0)
-        self.report({"INFO"}, f"Extended {n} strands to {context.window_manager.tokoya_n:.1f} cm")
+        from . import _mask_plant
+        removed = _mask_plant.remove_all_hair(obj)
+        self.report({"INFO"}, f"Removed {removed} strands")
         return {"FINISHED"}
 
 
@@ -84,29 +134,15 @@ class TOKOYA_OT_simulate(Operator):
         wm = context.window_manager
         _snapshot_sim_params(wm)
 
-        # Compute protected strand indices when Ref Object is a closed mesh
-        protected_indices = None
-        ref_name = wm.tokoya_ref_obj.strip()
-        if ref_name:
-            ref = bpy.data.objects.get(ref_name)
-            if ref is not None and ref.type == "MESH":
-                from . import _mesh_ops as _mo
-                from mathutils import Vector
-                import numpy as _np
-                if _mo._is_closed_mesh(ref):
-                    bvh   = _mo._build_bvh(ref)
-                    world = _mo._read_world_eval(obj)
-                    n_c   = len(world) // _mo._PPC
-                    prot  = [ci for ci in range(n_c)
-                             if _mo._is_inside_mesh(Vector(world[ci * _mo._PPC].tolist()), bvh)]
-                    if prot:
-                        protected_indices = _np.array(prot, dtype=_np.int32)
-                        self.report({"INFO"},
-                            f"Protecting {len(prot)} strands inside {ref_name!r}")
-
         from . import _world_passthrough as _wp
-        status = _wp.run_simulation(obj.name, int(wm.tokoya_n), context.scene,
-                                    protected_indices=protected_indices)
+        body_name = wm.tokoya_body_obj.strip()
+        body = bpy.data.objects.get(body_name)
+        if body is None or body.type != "MESH":
+            self.report({"ERROR"}, "Select a Body Mesh first"); return {"CANCELLED"}
+        _wp.BODY_COLLISION_TARGET = body.name
+        status = _wp.run_simulation(
+            obj.name, wm.tokoya_simulation_steps, context.scene
+        )
         if status.startswith("ERROR"):
             self.report({"ERROR"}, status); return {"CANCELLED"}
         self.report({"INFO"}, status)
@@ -123,7 +159,7 @@ class TOKOYA_OT_mesh_shrink(Operator):
         obj = _find_curves_obj()
         if obj is None:
             self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
-        ref_name = context.window_manager.tokoya_ref_obj.strip()
+        ref_name = context.window_manager.tokoya_cutter_obj.strip()
         ref = bpy.data.objects.get(ref_name)
         if ref is None or ref.type != "MESH":
             t = ref.type if ref else "not found"
@@ -134,36 +170,6 @@ class TOKOYA_OT_mesh_shrink(Operator):
         from . import _mesh_ops
         n = _mesh_ops.mesh_shrink(obj, ref)
         self.report({"INFO"}, f"Shrunk {n} strands")
-        return {"FINISHED"}
-
-
-class TOKOYA_OT_mesh_extend(Operator):
-    bl_idname      = "tokoya.mesh_extend"
-    bl_label       = "Mesh Extend"
-    bl_description = ("Set strands inside closed Ref mesh to N cm. "
-                      "Short strands are extended; long strands are shrunk. N = number field.")
-
-    def execute(self, context):
-        obj = _find_curves_obj()
-        if obj is None:
-            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
-        wm = context.window_manager
-        ref_name = wm.tokoya_ref_obj.strip()
-        ref = bpy.data.objects.get(ref_name)
-        if ref is None or ref.type != "MESH":
-            t = ref.type if ref else "not found"
-            self.report({"ERROR"},
-                f"Ref Object must be a closed MESH (got {t}). "
-                "Use UV Sphere or similar — not open meshes or Curve objects.")
-            return {"CANCELLED"}
-        from . import _mesh_ops
-        target_m = wm.tokoya_n / 100.0
-        n = _mesh_ops.mesh_extend_protected(obj, ref, target_m)
-        if n == 0:
-            self.report({"WARNING"},
-                f"{ref_name!r} is not a closed mesh, or no strands found inside.")
-            return {"CANCELLED"}
-        self.report({"INFO"}, f"Set {n} strands to {wm.tokoya_n:.1f} cm")
         return {"FINISHED"}
 
 
@@ -182,30 +188,48 @@ class TOKOYA_OT_urchin_reset(Operator):
         return {"FINISHED"}
 
 
-class TOKOYA_OT_pick_ref(Operator):
-    """Set Ref Object from the currently active (selected) object in the viewport."""
-    bl_idname      = "tokoya.pick_ref"
-    bl_label       = "Pick Active as Ref"
-    bl_description = "Set Ref Object to the active viewport object (any type)"
+class TOKOYA_OT_pick_body(Operator):
+    bl_idname = "tokoya.pick_body"
+    bl_label = "Pick Active as Body"
 
     def execute(self, context):
         obj = context.active_object
-        if obj is None:
-            self.report({"WARNING"}, "No active object in viewport")
+        if obj is None or obj.type != "MESH":
+            self.report({"WARNING"}, "Active object must be a mesh")
             return {"CANCELLED"}
-        context.window_manager.tokoya_ref_obj = obj.name
-        self.report({"INFO"}, f"Ref Object: {obj.name!r} ({obj.type})")
+        context.window_manager.tokoya_body_obj = obj.name
+        curves = _find_curves_obj()
+        if curves is not None:
+            curves.data.surface = obj
+            if obj.data.uv_layers.active:
+                curves.data.surface_uv_map = obj.data.uv_layers.active.name
+        self.report({"INFO"}, f"Body Mesh: {obj.name!r}")
+        return {"FINISHED"}
+
+
+class TOKOYA_OT_pick_cutter(Operator):
+    bl_idname = "tokoya.pick_cutter"
+    bl_label = "Pick Active as Cutter"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            self.report({"WARNING"}, "Active object must be a mesh")
+            return {"CANCELLED"}
+        context.window_manager.tokoya_cutter_obj = obj.name
+        self.report({"INFO"}, f"Cutter Mesh: {obj.name!r}")
         return {"FINISHED"}
 
 
 _classes = (
+    TOKOYA_OT_create_head_mask,
     TOKOYA_OT_plant_hair,
-    TOKOYA_OT_extend,
+    TOKOYA_OT_hair_remove,
     TOKOYA_OT_simulate,
     TOKOYA_OT_mesh_shrink,
-    TOKOYA_OT_mesh_extend,
     TOKOYA_OT_urchin_reset,
-    TOKOYA_OT_pick_ref,
+    TOKOYA_OT_pick_body,
+    TOKOYA_OT_pick_cutter,
 )
 
 
@@ -214,17 +238,33 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
 
-    WindowManager.tokoya_alpha = FloatProperty(
-        name="Radius a cm", description="Spiral radius for Plant Hair (cm)",
-        default=27.0, min=0.5, max=35.0, step=10, precision=1, options={"SKIP_SAVE"})
-    WindowManager.tokoya_beta = FloatProperty(
-        name="Spacing b cm", description="Root spacing for Plant Hair (cm)",
-        default=0.3, min=0.2, max=5.0, step=5, precision=2, options={"SKIP_SAVE"})
-    WindowManager.tokoya_n = FloatProperty(
-        name="N", description="Length cm (Extend) or Step count (Simulate)",
-        default=30.0, min=0.1, max=500.0, step=100, precision=1, options={"SKIP_SAVE"})
-    WindowManager.tokoya_ref_obj = StringProperty(
-        name="Ref Object", description="Empty (Plant) or Mesh (Shrink/Extend)",
+    WindowManager.tokoya_strand_count = IntProperty(
+        name="Strands", description="Total number of mask-planted strands",
+        default=4000, min=1, max=100000, options={"SKIP_SAVE"})
+    WindowManager.tokoya_max_length_cm = FloatProperty(
+        name="Max Length cm",
+        description="Black mask length; gray is linearly shorter and white is zero",
+        default=20.0, min=0.1, max=500.0, step=100, precision=1,
+        options={"SKIP_SAVE"})
+    WindowManager.tokoya_simulation_steps = IntProperty(
+        name="Simulation Steps", description="Number of XPBD simulation steps",
+        default=20, min=1, max=500, options={"SKIP_SAVE"})
+    WindowManager.tokoya_compute_backend = EnumProperty(
+        name="Compute",
+        description="Taichi compute backend; changing it rebuilds the solver",
+        items=(
+            ("CUDA", "CUDA", "NVIDIA CUDA"),
+            ("VULKAN", "Vulkan", "Vulkan compute"),
+            ("CPU", "CPU", "CPU backend"),
+        ),
+        default="CUDA",
+        options={"SKIP_SAVE"},
+    )
+    WindowManager.tokoya_body_obj = StringProperty(
+        name="Body Mesh", description="Animated surface and collision mesh",
+        default="", options={"SKIP_SAVE"})
+    WindowManager.tokoya_cutter_obj = StringProperty(
+        name="Cutter Mesh", description="Mesh used by Mesh Shrink",
         default="", options={"SKIP_SAVE"})
     WindowManager.tokoya_spring_ke = FloatProperty(
         name="Stiffness 10^N", default=math.log10(defaults["SPRING_KE"]),
@@ -259,7 +299,9 @@ def register():
 def unregister():
     ui.unregister()
     for name in (
-        "tokoya_alpha", "tokoya_beta", "tokoya_n", "tokoya_ref_obj",
+        "tokoya_strand_count", "tokoya_max_length_cm",
+        "tokoya_simulation_steps", "tokoya_compute_backend",
+        "tokoya_body_obj", "tokoya_cutter_obj",
         "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
         "tokoya_gravity", "tokoya_iterations", "tokoya_substeps",
         "tokoya_bending_enabled", "tokoya_root_bending_ke", "tokoya_bending_ke",

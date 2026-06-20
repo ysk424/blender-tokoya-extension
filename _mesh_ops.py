@@ -10,11 +10,8 @@ Coordinate convention
 
 Operations
 ----------
-extend_length        : scale all strands to a target arc-length (bigger urchin).
 mesh_shrink          : proportionally shrink strands to their first mesh intersection
                        (walking segments from root toward tip, bidirectional ray cast).
-mesh_extend_protected: set strands whose root is INSIDE a closed primitive to target length
-                       (extends short strands, shrinks long ones — uniform N cm cut).
 urchin_reset         : redistribute all strand points along root-normal direction
                        (arc-length preserved).
 """
@@ -25,7 +22,7 @@ import numpy as np
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
-_PPC = 8  # must match _spiral_plant.PPC
+_PPC = 9  # must match _mask_plant.POINTS_PER_STRAND
 
 
 # ------------------------------------------------------------------ #
@@ -80,37 +77,6 @@ def _build_bvh(ref_mesh_obj: bpy.types.Object) -> BVHTree:
     return bvh
 
 
-def _is_closed_mesh(ref_mesh_obj: bpy.types.Object) -> bool:
-    """Return True if the evaluated mesh has no open boundary edges."""
-    deps     = bpy.context.evaluated_depsgraph_get()
-    eval_obj = ref_mesh_obj.evaluated_get(deps)
-    mesh     = eval_obj.to_mesh()
-    edge_count: dict = {}
-    for poly in mesh.polygons:
-        for key in poly.edge_keys:
-            edge_count[key] = edge_count.get(key, 0) + 1
-    eval_obj.to_mesh_clear()
-    return bool(edge_count) and all(v >= 2 for v in edge_count.values())
-
-
-def _is_inside_mesh(point_w: Vector, bvh: BVHTree) -> bool:
-    """Ray counting inside/outside test for a closed mesh.
-
-    Cast a ray in +Z; count intersections. Odd = inside, even = outside.
-    Works for convex and concave closed meshes.
-    """
-    direction = Vector((0.0, 0.0, 1.0))
-    count  = 0
-    origin = point_w.copy()
-    for _ in range(64):  # safety cap
-        loc, _, _, _ = bvh.ray_cast(origin, direction)
-        if loc is None:
-            break
-        count += 1
-        origin = loc + direction * 1e-4
-    return (count % 2) == 1
-
-
 def _arc_length(pts_3d: np.ndarray) -> float:
     """Sum of segment lengths for one strand."""
     return float(np.sum(np.linalg.norm(np.diff(pts_3d, axis=0), axis=1)))
@@ -144,29 +110,6 @@ def _ray_cast_bidir(bvh: BVHTree, p0: Vector, p1: Vector):
 # ------------------------------------------------------------------ #
 # Public operations
 # ------------------------------------------------------------------ #
-
-def extend_length(curves_obj: bpy.types.Object, target_m: float) -> int:
-    """Scale every strand from root so total arc-length = target_m.
-
-    Works in local space (no mesh reference needed).
-    Returns number of strands modified.
-    """
-    local = _read_local(curves_obj)
-    n_c   = len(local) // _PPC
-    mod   = 0
-    for ci in range(n_c):
-        b    = ci * _PPC
-        root = local[b]
-        cur  = _arc_length(local[b:b + _PPC])
-        if cur < 1e-6:
-            continue
-        scale = target_m / cur
-        for j in range(1, _PPC):
-            local[b + j] = root + (local[b + j] - root) * scale
-        mod += 1
-    _write_local(curves_obj, local)
-    return mod
-
 
 def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) -> int:
     """Shrink each strand to its first intersection with ref_mesh.
@@ -223,43 +166,6 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
 
     _write_local(curves_obj, local)
     return shrunk
-
-
-def mesh_extend_protected(curves_obj: bpy.types.Object,
-                          ref_mesh_obj: bpy.types.Object,
-                          target_m: float) -> int:
-    """Set strands whose root is INSIDE a closed primitive to exactly target_m.
-
-    Strands shorter than target_m are extended; longer ones are shrunk.
-    Strands whose root is outside the primitive are left unchanged.
-
-    Requires a CLOSED mesh (no boundary edges).  Returns 0 if the mesh is open.
-    Returns number of strands modified.
-    """
-    if not _is_closed_mesh(ref_mesh_obj):
-        return 0
-    bvh   = _build_bvh(ref_mesh_obj)
-    local = _read_local(curves_obj)
-    world = _read_world_eval(curves_obj)
-    n_c   = len(local) // _PPC
-    mod   = 0
-
-    for ci in range(n_c):
-        b      = ci * _PPC
-        root_w = Vector(world[b].tolist())
-        if not _is_inside_mesh(root_w, bvh):
-            continue
-        cur = _arc_length(local[b:b + _PPC])
-        if cur < 1e-6:
-            continue
-        scale  = target_m / cur
-        root_l = local[b].copy()
-        for j in range(1, _PPC):
-            local[b + j] = root_l + (local[b + j] - root_l) * scale
-        mod += 1
-
-    _write_local(curves_obj, local)
-    return mod
 
 
 def urchin_reset(curves_obj: bpy.types.Object) -> int:

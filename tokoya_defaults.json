@@ -1,10 +1,10 @@
 {
     "SPRING_KE":             10000.0,
-    "DAMPING":               0.01,
+    "DAMPING":               0.05,
     "PARTICLE_MASS":         1.0,
     "GRAVITY":               -9.81,
-    "ITERATIONS":            10,
-    "SUBSTEPS":              4,
+    "ITERATIONS":            20,
+    "SUBSTEPS":              8,
     "BENDING_ENABLED":       true,
     "ROOT_BENDING_KE":       2000.0,
     "BENDING_KE":            10.0,

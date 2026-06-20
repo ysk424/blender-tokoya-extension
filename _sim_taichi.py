@@ -11,37 +11,46 @@ import sys
 import site
 import numpy as np
 
-_PYTHON_USER_SITE = r"C:\Users\azoo\AppData\Roaming\Python\Python313\site-packages"
-
 _ti          = None
 _SolverClass = None
+_backend     = None
 
 
-def _ensure_taichi():
-    global _ti
-    if _ti is not None:
+def _ensure_taichi(backend: str = "CUDA"):
+    global _ti, _SolverClass, _backend
+    backend = backend.upper()
+    if _ti is not None and _backend == backend:
         return _ti
-    if _PYTHON_USER_SITE not in sys.path:
-        site.addsitedir(_PYTHON_USER_SITE)
+    user_site = site.getusersitepackages()
+    if user_site not in sys.path:
+        site.addsitedir(user_site)
     import taichi as ti
-    try:
-        ti.init(arch=ti.cuda, device_memory_fraction=0.5)
-        print("[tokoya/taichi] CUDA initialized (sm_120 OK)")
-    except Exception as e:
-        print(f"[tokoya/taichi] CUDA failed ({e}), falling back to CPU")
-        ti.init(arch=ti.cpu)
-        print("[tokoya/taichi] CPU initialized")
+    if _ti is not None:
+        ti.reset()
+        _SolverClass = None
+    arch = {
+        "CUDA": ti.cuda,
+        "VULKAN": ti.vulkan,
+        "CPU": ti.cpu,
+    }.get(backend)
+    if arch is None:
+        raise ValueError(f"Unsupported Taichi backend: {backend!r}")
+    kwargs = {"arch": arch}
+    if backend == "CUDA":
+        kwargs["device_memory_fraction"] = 0.5
+    ti.init(**kwargs)
+    print(f"[tokoya/taichi] {backend} initialized")
     _ti = ti
+    _backend = backend
     return ti
 
 
-def get_solver_class():
+def get_solver_class(backend: str = "CUDA"):
     """Return (creating if needed) the TaichiXPBDSolver class."""
     global _SolverClass
+    ti = _ensure_taichi(backend)
     if _SolverClass is not None:
         return _SolverClass
-
-    ti = _ensure_taichi()
 
     @ti.data_oriented
     class TaichiXPBDSolver:
@@ -263,15 +272,14 @@ def get_solver_class():
             damping:         float,
             bending_enabled: bool,
             body_collision_fn = None,       # callable(pred_np) → None, or None
+            post_collision_iterations: int = 4,
         ) -> np.ndarray:
             """Run one Blender frame → return final (n_total, 3) positions.
 
-            body_collision_fn: if given, called on pos_pred (n_total,3) float32
-            after each substep's constraint loop and BEFORE _update_vel_pos.
-            It modifies the array in-place (push particles out of body).
-            Because the correction lands in pos_pred, _update_vel_pos derives
-            velocity = (pos_pred - pos) / dt which automatically includes the
-            collision push — no separate velocity clamping needed.
+            body_collision_fn: modifies predicted positions and velocities.
+            Collision displacement is excluded from velocity. A short
+            spring/collision reconciliation loop follows the first contact
+            pass so contact correction does not leave stretched segments.
             """
             dt_sub   = float(dt) / float(n_substeps)
             roots_np = np.ascontiguousarray(new_root_world, dtype=np.float32)
@@ -284,12 +292,43 @@ def get_solver_class():
                     self._solve_springs(dt_sub, float(seg_ke),
                                         float(root_bend_ke), float(bend_ke),
                                         do_bend)
-                # Body collision: modify pos_pred, then derive velocity normally.
+                # Body collision may modify positions and velocities. Collision
+                # displacement is deliberately excluded from velocity so a
+                # push-out does not become a bounce impulse.
                 if body_collision_fn is not None:
+                    pos_np  = self.pos.to_numpy()
                     pred_np = self.pos_pred.to_numpy()
-                    body_collision_fn(pred_np)          # push out, in-place
+                    vel_np  = (
+                        (pred_np - pos_np) / dt_sub * (1.0 - float(damping))
+                    ).astype(np.float32, copy=False)
+                    body_collision_fn(
+                        pos_np, pred_np, vel_np, allow_sweep=True
+                    )
                     self.upload_pred_positions(pred_np)
-                self._update_vel_pos(dt_sub, float(damping))
+                    for _ in range(max(int(post_collision_iterations), 0)):
+                        self._solve_springs(
+                            dt_sub, float(seg_ke),
+                            float(root_bend_ke), float(bend_ke),
+                            do_bend,
+                        )
+                        pred_np = self.pos_pred.to_numpy()
+                        body_collision_fn(
+                            pos_np, pred_np, vel_np, allow_sweep=False
+                        )
+                        self.upload_pred_positions(pred_np)
+                    pred_np = self.pos_pred.to_numpy()
+                    body_collision_fn(
+                        pos_np, pred_np, vel_np,
+                        allow_sweep=False, final_cleanup=True,
+                    )
+                    self.pos.from_numpy(
+                        np.ascontiguousarray(pred_np, dtype=np.float32)
+                    )
+                    self.vel.from_numpy(
+                        np.ascontiguousarray(vel_np, dtype=np.float32)
+                    )
+                else:
+                    self._update_vel_pos(dt_sub, float(damping))
 
             return self.pos.to_numpy()
 
@@ -302,48 +341,19 @@ def get_solver_class():
 # ------------------------------------------------------------------ #
 
 def build_body_bvh(body_name: str):
-    """Build a BVHTree from the evaluated (skinned) body mesh."""
+    """Build a world-space BVH from the evaluated (skinned) body mesh."""
     import bpy
     from mathutils.bvhtree import BVHTree
     body_obj = bpy.data.objects.get(body_name)
     if body_obj is None or body_obj.type != "MESH":
         return None
     dg = bpy.context.evaluated_depsgraph_get()
-    return BVHTree.FromObject(body_obj.evaluated_get(dg), dg, epsilon=0.0)
-
-
-def apply_body_collision(
-    positions:  np.ndarray,     # (n_total, 3) float32, world — modified in-place
-    bvh,
-    root_mask:  np.ndarray = None,  # (n_total,) bool — True = kinematic root, skip
-    margin:     float = 0.005,
-) -> int:
-    """Push hair particles out of the body mesh surface.
-
-    Returns the number of particles that were corrected (for diagnostics).
-
-    Uses BVHTree.find_nearest: compute depth = (pt - nearest_surface).dot(face_normal).
-    depth > 0 → outside; depth < 0 → inside.
-    Any particle with depth < margin is pushed outward to depth == margin.
-
-    Kinematic root particles (root_mask[i] == True) are skipped because
-    they are driven by the head animation and must stay on the scalp.
-    """
-    from mathutils import Vector
-    n_pushed = 0
-    n = len(positions)
-    for i in range(n):
-        if root_mask is not None and root_mask[i]:
-            continue                        # skip kinematic roots
-        pt             = Vector(positions[i])
-        loc, normal, _, _ = bvh.find_nearest(pt)
-        if loc is None or normal is None:
-            continue
-        depth = (pt - loc).dot(normal)      # >0 outside, <0 inside
-        if depth < margin:
-            c = normal * (margin - depth)
-            positions[i, 0] += c.x
-            positions[i, 1] += c.y
-            positions[i, 2] += c.z
-            n_pushed += 1
-    return n_pushed
+    eval_obj = body_obj.evaluated_get(dg)
+    mesh = eval_obj.to_mesh()
+    try:
+        matrix = eval_obj.matrix_world
+        vertices = [matrix @ vertex.co for vertex in mesh.vertices]
+        polygons = [tuple(poly.vertices) for poly in mesh.polygons]
+        return BVHTree.FromPolygons(vertices, polygons)
+    finally:
+        eval_obj.to_mesh_clear()

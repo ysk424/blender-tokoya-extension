@@ -1,15 +1,15 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.2.6"
+version = "0.3.5"
 name = "Tokoya"
-tagline = "Barber tool — plant, drape, cut hair with Taichi XPBD"
+tagline = "Tokoya (床屋, barber) — Taichi XPBD hair styling"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
 type = "add-on"
 
 blender_version_min = "5.1.0"
 
-license = ["SPDX:Apache-2.0"]
+license = ["SPDX:MIT"]
 
 tags = ["Physics"]
 
@@ -21,7 +21,9 @@ paths = [
     "ui.py",
     "_world_passthrough.py",
     "_sim_taichi.py",
-    "_spiral_plant.py",
+    "_mask_plant.py",
     "_mesh_ops.py",
     "tokoya_defaults.json",
+    "README.md",
+    "LICENSE",
 ]

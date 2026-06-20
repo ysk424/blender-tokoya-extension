@@ -23,20 +23,22 @@ from __future__ import annotations
 import bpy
 import numpy as np
 
-_PYTHON_USER_SITE = r'C:\Users\azoo\AppData\Roaming\Python\Python313\site-packages'
-
-POINTS_PER_STRAND = 8  # must match _spiral_plant.PPC and _mesh_ops._PPC
+POINTS_PER_STRAND = 9  # must match _mask_plant.POINTS_PER_STRAND
 
 SPRING_KE              = 1e4
-DAMPING                = 0.01
+DAMPING                = 0.05
 PARTICLE_MASS          = 1.0
 GRAVITY                = -9.81
-ITERATIONS             = 10
-SUBSTEPS               = 4
+ITERATIONS             = 20
+SUBSTEPS               = 8
 BENDING_ENABLED        = True
 ROOT_BENDING_KE        = 2000.0
 BENDING_KE             = 10.0
 BODY_COLLISION_TARGET  = 'CC_Base_Body'
+COMPUTE_BACKEND        = 'CUDA'
+COLLISION_MARGIN       = 0.0005
+COLLISION_SEARCH       = 0.003
+POST_COLLISION_ITERATIONS = 4
 
 
 def _read_world(data_owner, n_total: int, matrix_world) -> 'np.ndarray | None':
@@ -67,10 +69,6 @@ def _write_world(obj, world_pts: np.ndarray,
 
 def run_simulation(curves_obj_name: str, n_steps: int,
                    scene, protected_indices=None) -> str:
-    import sys
-    if _PYTHON_USER_SITE not in sys.path:
-        sys.path.insert(0, _PYTHON_USER_SITE)
-
     obj = bpy.data.objects.get(curves_obj_name)
     if obj is None or obj.type != 'CURVES':
         return f'ERROR: {curves_obj_name!r} not found or not CURVES'
@@ -113,7 +111,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
 
     try:
         from . import _sim_taichi
-        cls    = _sim_taichi.get_solver_class()
+        cls    = _sim_taichi.get_solver_class(COMPUTE_BACKEND)
         solver = cls(
             n_total         = n_total,
             n_strands       = n_strands,
@@ -134,12 +132,124 @@ def run_simulation(curves_obj_name: str, n_steps: int,
     if body_bvh is None:
         print(f'[tokoya/sim] WARNING: BVH build failed for {BODY_COLLISION_TARGET!r}')
 
-    def _body_fn(pred_np, _bvh=body_bvh, _mask=root_mask):
+    from mathutils import Vector
+
+    collision_stats = {
+        "sweep": 0, "near": 0, "segment": 0, "velocity": 0,
+        "reconcile": 0,
+    }
+
+    def _body_fn(pos_np, pred_np, vel_np,
+                 allow_sweep=True,
+                 final_cleanup=False,
+                 _bvh=body_bvh, _mask=root_mask):
         if _bvh is None:
             return
-        n_pushed = _st.apply_body_collision(pred_np, _bvh, root_mask=_mask, margin=0.005)
-        if n_pushed > 0:
-            print(f'[tokoya/sim] collision: pushed {n_pushed} pts')
+        normals = np.zeros_like(pred_np)
+        contacted = np.zeros(n_total, dtype=bool)
+
+        # Continuous point collision: sweep old -> predicted position.
+        for i in range(n_total):
+            if _mask[i]:
+                vel_np[i] = 0.0
+                continue
+            p0 = Vector(pos_np[i].tolist())
+            p1 = Vector(pred_np[i].tolist())
+            delta = p1 - p0
+            length = delta.length
+            hit = False
+            if allow_sweep and length > 1e-9:
+                loc, normal, _, dist = _bvh.ray_cast(
+                    p0, delta / length, length
+                )
+                if (
+                    loc is not None
+                    and dist <= length
+                    and delta.dot(normal) < 0.0
+                ):
+                    normal.normalize()
+                    corrected = loc + normal * COLLISION_MARGIN
+                    pred_np[i] = corrected
+                    normals[i] = normal
+                    contacted[i] = True
+                    collision_stats["sweep"] += 1
+                    hit = True
+            if not hit:
+                point = Vector(pred_np[i].tolist())
+                loc, normal, _, dist = _bvh.find_nearest(point)
+                if loc is not None and dist < COLLISION_SEARCH:
+                    normal.normalize()
+                    signed = (point - loc).dot(normal)
+                    if signed < COLLISION_MARGIN:
+                        corrected = loc + normal * COLLISION_MARGIN
+                        pred_np[i] = corrected
+                        normals[i] = normal
+                        contacted[i] = True
+                        collision_stats["near"] += 1
+
+        # A polyline edge can cross the body while both endpoint particles
+        # remain outside. Constrain every strand segment as well.
+        cleanup_passes = 4 if final_cleanup else 1
+        for _ in range(cleanup_passes):
+            for strand in range(n_strands):
+                base = strand * POINTS_PER_STRAND
+                for segment in range(POINTS_PER_STRAND - 1):
+                    i = base + segment
+                    j = i + 1
+                    p0 = Vector(pred_np[i].tolist())
+                    p1 = Vector(pred_np[j].tolist())
+                    delta = p1 - p0
+                    length = delta.length
+                    if length < 1e-9:
+                        continue
+                    loc, normal, _, dist = _bvh.ray_cast(
+                        p0, delta / length, length
+                    )
+                    if (
+                        loc is None
+                        or not (1e-6 < dist < length - 1e-6)
+                    ):
+                        continue
+                    normal.normalize()
+                    target = loc + normal * COLLISION_MARGIN
+                    if final_cleanup:
+                        if not _mask[j]:
+                            pred_np[j] = target
+                            normals[j] = normal
+                            contacted[j] = True
+                            collision_stats["segment"] += 1
+                        continue
+                    correction = np.array(
+                        target - loc, dtype=np.float32
+                    )
+                    fraction = dist / length
+                    wi = 0.0 if _mask[i] else 1.0
+                    wj = 0.0 if _mask[j] else 1.0
+                    denom = wi * (1.0 - fraction) ** 2 + wj * fraction ** 2
+                    if denom <= 1e-12:
+                        continue
+                    if wi > 0.0:
+                        scale_i = (1.0 - fraction) * wi / denom
+                        pred_np[i] += correction * scale_i
+                        normals[i] = normal
+                        contacted[i] = True
+                    if wj > 0.0:
+                        scale_j = fraction * wj / denom
+                        pred_np[j] += correction * scale_j
+                        normals[j] = normal
+                        contacted[j] = True
+                    collision_stats["segment"] += 1
+                    if not allow_sweep:
+                        collision_stats["reconcile"] += 1
+
+        # Remove only inward normal velocity. The collision displacement is
+        # not part of vel_np, preventing artificial bounce impulses.
+        for i in np.nonzero(contacted)[0]:
+            normal = normals[i]
+            normal_speed = float(np.dot(vel_np[i], normal))
+            if normal_speed < 0.0:
+                vel_np[i] -= normal * normal_speed
+                collision_stats["velocity"] += 1
 
     print(f'[tokoya/sim] {n_steps} steps, {n_strands} strands, '
           f'ke={SPRING_KE:.4g}, damping={DAMPING:.4g}')
@@ -159,6 +269,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
             damping           = DAMPING,
             bending_enabled   = BENDING_ENABLED,
             body_collision_fn = _body_fn,
+            post_collision_iterations = POST_COLLISION_ITERATIONS,
         )
         curr_vel   = solver.get_velocities_numpy()
         curr_world = sim_out
@@ -166,6 +277,26 @@ def run_simulation(curves_obj_name: str, n_steps: int,
             curr_world[prot_mask] = prot_init
             curr_vel[prot_mask]   = 0.0
 
+    # Final safety audit: spring reconciliation can leave a small number of
+    # distal edge crossings. Resolve only those residual crossings without
+    # feeding the displacement back into velocity.
+    for _ in range(8):
+        before = collision_stats["segment"]
+        _body_fn(
+            curr_world, curr_world, curr_vel,
+            allow_sweep=False, final_cleanup=True,
+        )
+        if collision_stats["segment"] == before:
+            break
+
     _write_world(obj, curr_world, offset=offset_w)
+    print(
+        '[tokoya/sim] collision totals: '
+        f'sweep={collision_stats["sweep"]}, '
+        f'near={collision_stats["near"]}, '
+        f'segment={collision_stats["segment"]}, '
+        f'reconcile={collision_stats["reconcile"]}, '
+        f'velocity={collision_stats["velocity"]}'
+    )
     print(f'[tokoya/sim] done')
     return f'OK: {n_steps} steps, {n_strands} strands'
