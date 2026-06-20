@@ -7,6 +7,24 @@ This file is a handoff log for Claude Code sessions.
 
 ## ⚠️ START HERE — Tokoya v0.4.4 (2026-06-20)
 
+### プロジェクト休止スナップショット
+
+- Tokoya v0.4.4を現在の安定版として、当面の開発を終了する。
+- 配布ZIP: `dist/tokoya-0.4.4.zip`
+- SHA256:
+  `BF02757A0206AAD75AC7D2EED5AA94676A226FD474315C28AB28C4A03EF0619E`
+- 本番実測はGPU共有化前の80フレーム/分から120フレーム/分へ向上。
+  総処理速度は1.5倍。
+- CUDA時はXPBD物理とWarp Body衝突が同じGPU配列を共有する。
+  CPU/VulkanおよびWarp失敗時のフォールバックは維持。
+- 初期設定はBending OFF、Stiffness 9.0、Damping 8.0、Mass 100。
+- Collision Proxyは複数方式を実機検証したが、本番速度が
+  120フレーム/分のまま変化しなかったため不採用。下記記録を参照。
+- 今後はバグが見つかった場合にのみ再開する。再開時はまず再現条件を固定し、
+  v0.4.4との差分を最小化して修正する。
+- 効果を実測できない最適化や、シミュレーション品質を変える変更は
+  推測だけで採用しない。
+
 ### Collision Proxy実験記録 — 不採用・削除済み
 
 - 目的: 449,472三角形の`CC_Base_Body`を軽量な衝突対象へ置き換え、
