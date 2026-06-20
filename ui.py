@@ -96,7 +96,7 @@ class TOKOYA_PT_main(Panel):
         col.prop(wm, "tokoya_gravity")
         col.separator()
         col.prop(wm, "tokoya_iterations")
-        col.prop(wm, "tokoya_substeps")
+        col.prop(wm, "tokoya_interpolation_mag")
         col.separator()
         col.prop(wm, "tokoya_bending_enabled")
         if getattr(wm, "tokoya_bending_enabled", False):

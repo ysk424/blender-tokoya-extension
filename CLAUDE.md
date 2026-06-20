@@ -5,6 +5,19 @@ This file is a handoff log for Claude Code sessions.
 
 ---
 
+## Tokoya v0.5.0 (2026-06-21)
+
+- v0.5.xはヘアーモデリング改善系列。大々的な公開pushは保留。
+- GravityをXYZベクトル化。既定値`(0, 0, -9.81)`。
+- 長い髪の初期整髪時に`+Y`重力を一時指定し、後方へ誘導可能。
+- 旧Substeps UIを廃止。物理Substepsは内部で1固定。
+- 旧Substeps位置へ`Interpolation Mag`を追加。既定1、範囲1～16。
+- Autoまたは手動Frame InterpolationへInterpolation Magを乗算する。
+- v0.4.8の固定2倍を廃止。Auto基礎値はv0.4.7相当へ戻す。
+- Iterations既定値を20から10へ変更。
+
+---
+
 ## Tokoya v0.4.8 (2026-06-21)
 
 - Auto Frame Interpolationが少し粗かったため、自動ステップ数を2倍化。

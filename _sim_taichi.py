@@ -151,7 +151,10 @@ def get_solver_class(backend: str = "CUDA"):
         # ------------------------------------------------------------------ #
 
         @ti.kernel
-        def _predict(self, dt: ti.f32, gravity: ti.f32):
+        def _predict(
+            self, dt: ti.f32,
+            gravity_x: ti.f32, gravity_y: ti.f32, gravity_z: ti.f32,
+        ):
             """Apply gravity, advance free particles; set kinematic points.
 
             k == 0: root — driven by head animation (roots field).
@@ -172,7 +175,9 @@ def get_solver_class(backend: str = "CUDA"):
                     self.pos[i]      = p1
                     self.pos_pred[i] = p1
                 else:
-                    self.vel[i][2]   += gravity * dt
+                    self.vel[i] += ti.Vector([
+                        gravity_x, gravity_y, gravity_z
+                    ]) * dt
                     self.pos_pred[i]  = self.pos[i] + self.vel[i] * dt
 
         @ti.kernel
@@ -270,7 +275,7 @@ def get_solver_class(backend: str = "CUDA"):
             dt:              float,
             n_substeps:      int,
             n_iter:          int,
-            gravity:         float,
+            gravity,
             new_root_world:  np.ndarray,    # (n_strands, 3)
             seg_ke:          float,
             root_bend_ke:    float,
@@ -289,6 +294,7 @@ def get_solver_class(backend: str = "CUDA"):
             pass so contact correction does not leave stretched segments.
             """
             dt_sub   = float(dt) / float(n_substeps)
+            gravity_np = np.asarray(gravity, dtype=np.float32).reshape(3)
             roots_np = np.ascontiguousarray(new_root_world, dtype=np.float32)
             if new_point1_world is None:
                 point1_np = roots_np + self.seg1_offset.to_numpy()
@@ -301,7 +307,12 @@ def get_solver_class(backend: str = "CUDA"):
             for _ in range(n_substeps):
                 self.roots.from_numpy(roots_np)
                 self.point1s.from_numpy(point1_np)
-                self._predict(dt_sub, float(gravity))
+                self._predict(
+                    dt_sub,
+                    float(gravity_np[0]),
+                    float(gravity_np[1]),
+                    float(gravity_np[2]),
+                )
                 for _ in range(n_iter):
                     self._solve_springs(dt_sub, float(seg_ke),
                                         float(root_bend_ke), float(bend_ke),

@@ -3,7 +3,8 @@ import json, math, os
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import (
-    BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty,
+    BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty,
+    IntProperty, StringProperty,
 )
 from bpy.types import Operator, WindowManager
 from . import ui
@@ -20,9 +21,9 @@ def _snapshot_sim_params(wm):
     _wp.SPRING_KE       = 10.0 ** wm.tokoya_spring_ke
     _wp.DAMPING         = wm.tokoya_damping       / 100.0
     _wp.PARTICLE_MASS   = wm.tokoya_particle_mass / 1000.0
-    _wp.GRAVITY         = wm.tokoya_gravity
+    _wp.GRAVITY         = tuple(wm.tokoya_gravity)
     _wp.ITERATIONS      = wm.tokoya_iterations
-    _wp.SUBSTEPS        = wm.tokoya_substeps
+    _wp.SUBSTEPS        = 1
     _wp.BENDING_ENABLED = wm.tokoya_bending_enabled
     _wp.ROOT_BENDING_KE = 10.0 ** wm.tokoya_root_bending_ke
     _wp.BENDING_KE      = 10.0 ** wm.tokoya_bending_ke
@@ -341,8 +342,15 @@ def register():
             ),
             default=True, options={"SKIP_SAVE"})
         WindowManager.tokoya_auto_interpolation_current = IntProperty(
-            name="Auto Steps", default=1, min=1, max=64,
+            name="Auto Steps", default=1, min=1, max=1024,
             options={"SKIP_SAVE"})
+        WindowManager.tokoya_interpolation_mag = IntProperty(
+            name="Interpolation Mag",
+            description=(
+                "Multiply Auto or manual Frame Interpolation by this value"
+            ),
+            default=int(defaults["INTERPOLATION_MAG"]),
+            min=1, max=16, options={"SKIP_SAVE"})
         WindowManager.tokoya_record_mode = EnumProperty(
             name="Recording Mode",
             items=(
@@ -378,15 +386,13 @@ def register():
         WindowManager.tokoya_particle_mass = FloatProperty(
             name="Mass /1000", default=defaults["PARTICLE_MASS"] * 1000.0,
             min=1.0, max=10000.0, step=100, precision=1, options={"SKIP_SAVE"})
-        WindowManager.tokoya_gravity = FloatProperty(
+        WindowManager.tokoya_gravity = FloatVectorProperty(
             name="Gravity m/s2", default=defaults["GRAVITY"],
-            min=-20.0, max=0.0, step=10, precision=2, options={"SKIP_SAVE"})
+            size=3, subtype="XYZ", min=-100.0, max=100.0,
+            step=10, precision=2, options={"SKIP_SAVE"})
         WindowManager.tokoya_iterations = IntProperty(
             name="Iterations", default=int(defaults["ITERATIONS"]),
             min=1, max=64, options={"SKIP_SAVE"})
-        WindowManager.tokoya_substeps = IntProperty(
-            name="Substeps", default=int(defaults["SUBSTEPS"]),
-            min=1, max=16, options={"SKIP_SAVE"})
         WindowManager.tokoya_bending_enabled = BoolProperty(
             name="Bending", default=bool(defaults["BENDING_ENABLED"]),
             options={"SKIP_SAVE"})
@@ -418,10 +424,11 @@ def register():
             "tokoya_simulation_steps", "tokoya_frame_interpolation",
             "tokoya_auto_frame_interpolation",
             "tokoya_auto_interpolation_current",
+            "tokoya_interpolation_mag",
             "tokoya_record_mode", "tokoya_compute_backend",
             "tokoya_body_obj", "tokoya_cutter_obj",
             "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
-            "tokoya_gravity", "tokoya_iterations", "tokoya_substeps",
+            "tokoya_gravity", "tokoya_iterations",
             "tokoya_bending_enabled", "tokoya_root_bending_ke",
             "tokoya_bending_ke",
         ):
@@ -447,10 +454,11 @@ def unregister():
         "tokoya_simulation_steps", "tokoya_frame_interpolation",
         "tokoya_auto_frame_interpolation",
         "tokoya_auto_interpolation_current",
+        "tokoya_interpolation_mag",
         "tokoya_record_mode", "tokoya_compute_backend",
         "tokoya_body_obj", "tokoya_cutter_obj",
         "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
-        "tokoya_gravity", "tokoya_iterations", "tokoya_substeps",
+        "tokoya_gravity", "tokoya_iterations",
         "tokoya_bending_enabled", "tokoya_root_bending_ke", "tokoya_bending_ke",
     ):
         try: delattr(WindowManager, name)

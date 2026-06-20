@@ -49,8 +49,10 @@ wm = bpy.context.window_manager
 wm.tokoya_body_obj = body.name
 wm.tokoya_compute_backend = os.environ.get("TOKOYA_TEST_BACKEND", "CPU")
 wm.tokoya_frame_interpolation = 2
-assert wm.tokoya_substeps == 1
-wm.tokoya_iterations = 1
+assert np.allclose(tuple(wm.tokoya_gravity), (0.0, 0.0, -9.81))
+assert wm.tokoya_iterations == 10
+assert wm.tokoya_interpolation_mag == 1
+wm.tokoya_interpolation_mag = 2
 wm.tokoya_simulation_steps = 1
 
 from tokoya_test import _recording
@@ -65,11 +67,17 @@ target_roots = spacing_roots + np.array(
 )
 assert _recording._auto_interpolation_count(
     spacing_roots, target_roots, spacing
-) == 30
+) == 15
 
-# The existing single-frame styling path remains compatible.
+# Gravity is a full XYZ vector. A temporary +Y gravity moves free points
+# backward while the two follicle points remain kinematic.
+wm.tokoya_gravity = (0.0, 9.81, 0.0)
 result = bpy.ops.tokoya.simulate()
 assert result == {"FINISHED"}, result
+after_sim = np.empty(27, dtype=np.float32)
+curves_data.attributes["position"].data.foreach_get("vector", after_sim)
+assert after_sim.reshape(-1, 3)[2:, 1].max() > 0.0
+wm.tokoya_gravity = (0.0, 0.0, -9.81)
 
 result = bpy.ops.tokoya.record()
 assert result == {"FINISHED"}, result
@@ -80,7 +88,7 @@ scene.frame_set(2)
 
 assert sorted(_recording.manager.frames) == [1, 2]
 assert np.isfinite(_recording.manager.frames[2][0]).all()
-assert wm.tokoya_auto_interpolation_current == 64
+assert wm.tokoya_auto_interpolation_current == 128
 
 # Reverse playback aborts recording and restores the cached frame.
 scene.frame_set(1)

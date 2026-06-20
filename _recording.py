@@ -17,7 +17,6 @@ CACHE_SUFFIX = ".tokoya-cache.npz"
 AUTO_INTERPOLATION_MIN = 1
 AUTO_INTERPOLATION_MAX = 64
 AUTO_SPACING_FRACTION = 0.25
-AUTO_STEP_MULTIPLIER = 2
 AUTO_SAFETY_FACTOR = 1.1
 
 
@@ -60,7 +59,7 @@ def _auto_interpolation_count(
     target_roots: np.ndarray,
     median_spacing: float,
 ) -> int:
-    """Choose twice the original motion-based interpolation count."""
+    """Choose a motion-based interpolation count."""
     if (
         previous_roots.shape != target_roots.shape
         or len(previous_roots) == 0
@@ -73,10 +72,7 @@ def _auto_interpolation_count(
     if max_move <= 1.0e-8:
         return AUTO_INTERPOLATION_MIN
     target_step = median_spacing * AUTO_SPACING_FRACTION
-    base_count = int(
-        np.ceil(max_move * AUTO_SAFETY_FACTOR / target_step)
-    )
-    count = base_count * AUTO_STEP_MULTIPLIER
+    count = int(np.ceil(max_move * AUTO_SAFETY_FACTOR / target_step))
     return max(
         AUTO_INTERPOLATION_MIN,
         min(AUTO_INTERPOLATION_MAX, count),
@@ -372,6 +368,7 @@ class RecordingManager:
             )
         else:
             interpolation = max(1, int(wm.tokoya_frame_interpolation))
+        interpolation *= max(1, int(wm.tokoya_interpolation_mag))
         wm.tokoya_auto_interpolation_current = interpolation
         fps = float(scene.render.fps) / float(scene.render.fps_base)
         if fps <= 0.0:

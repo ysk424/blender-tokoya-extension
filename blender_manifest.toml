@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.4.8"
+version = "0.5.0"
 name = "Tokoya"
 tagline = "Tokoya (床屋, barber) — Taichi XPBD hair styling"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"

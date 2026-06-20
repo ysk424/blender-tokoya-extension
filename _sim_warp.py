@@ -14,7 +14,9 @@ def _predict(
     point1s: wp.array(dtype=wp.vec3),
     points_per_strand: int,
     dt: float,
-    gravity: float,
+    gravity_x: float,
+    gravity_y: float,
+    gravity_z: float,
 ):
     i = wp.tid()
     strand = i // points_per_strand
@@ -27,7 +29,11 @@ def _predict(
         predicted[i] = point1s[strand]
     else:
         velocity = vel[i]
-        velocity = wp.vec3(velocity[0], velocity[1], velocity[2] + gravity * dt)
+        velocity = velocity + wp.vec3(
+            gravity_x * dt,
+            gravity_y * dt,
+            gravity_z * dt,
+        )
         vel[i] = velocity
         predicted[i] = pos[i] + velocity * dt
 
@@ -251,6 +257,7 @@ class WarpXPBDSolver:
         post_collision_iterations=4,
     ):
         dt_sub = float(dt) / float(n_substeps)
+        gravity_np = np.asarray(gravity, dtype=np.float32).reshape(3)
         roots_np = np.ascontiguousarray(new_root_world, dtype=np.float32)
         if new_point1_world is None:
             point1_np = roots_np + self.seg1_offset
@@ -273,7 +280,9 @@ class WarpXPBDSolver:
                     self.point1s,
                     self.pps,
                     dt_sub,
-                    float(gravity),
+                    float(gravity_np[0]),
+                    float(gravity_np[1]),
+                    float(gravity_np[2]),
                 ],
                 device=self.device,
             )
