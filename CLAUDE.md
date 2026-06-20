@@ -5,48 +5,66 @@ This file is a handoff log for Claude Code sessions.
 
 ---
 
-## ⚠️ START HERE — Tokoya v0.3.5 (2026-06-20)
+## ⚠️ START HERE — Tokoya v0.4.2 (2026-06-20)
 
-**v0.3.xシリーズ完了・公開版。**
+### v0.4.x タイムライン録画
+
+- v0.3.5は最初の公開MIT版。v0.2.xはClaude Codeによる非公開開発。
+- 既存の`Simulate`は現在フレームの静的整髪用として維持。
+- `REC`トグルと`Frame Interpolation`を追加。
+- 順方向へ1フレームずつ進む場合のみ録画し、逆再生・ジャンプは録画を中止。
+- 録画停止後はPLAYBACKへ移行。未録画フレームではCurvesを変更しない。
+- Blenderの`fps_base / fps`を実秒として使い、フレーム間を指定回数で評価。
+- 各小数フレームで評価済みBody BVH、毛根、毛包方向を更新してCUDA計算。
+- 再録画開始フレーム以降は上書き。
+- 位置と速度をRAM保持し、`.blend`保存時に隣接する
+  `<project>.blend.tokoya-cache.npz`へ圧縮保存。再読込時にPLAYBACK可能。
+- v0.4.1: Blender拡張登録時の`_RedirectData`に`filepath`がない問題を修正。
+  登録途中の例外ではOperator、Panel、WM Property、handlerをロールバックする。
+- v0.4.2: `Sync to Audio`が重い計算中にフレームを飛ばし、ジャンプ判定で
+  RECが停止する問題を修正。REC中だけ`scene.sync_mode = "NONE"`
+  （Play Every Frame）へ変更し、停止時に元の設定へ戻す。
+- Blender 5.1.2でCPU/CUDA、既存Simulate、録画、逆再生アボート、
+  再録画上書き、保存・再読込、登録失敗ロールバックを自動試験済み。
 
 MIT Licenseで公開。公開名`Tokoya`は日本語の「床屋」、英語の`barber`。
-v0.3.5でUVマスク植毛、9点非等間隔関節、Body追従、CUDA/Vulkan/CPU、
-連続Body衝突、Mesh Shrink、Hair Removeまで完成。
+v0.3.5で静的スタイリングを初公開し、v0.4.xでCUDAタイムライン録画を追加。
 
 **This repo**: `blender-tokoya-extension`
-**Active branch**: `vbd-features-applied` HEAD = `f6efff8`  
-**Install zip**: `dist/tokoya-0.2.6.zip` — 要ビルド・インストール確認  
+**Active branch**: `vbd-features-applied`（GitHub `origin/main`を追跡）
+**Install zip**: `dist/tokoya-0.4.2.zip`
 **N-panel tab**: "Tokoya"  
 **Blender**: 5.1, Windows x64, RTX 5070 Ti (CUDA sm_120)
 
 ### このプロジェクトは何か
 
-**床屋（Tokoya）**: 美容師向け Blender 5.1 ヘアー制作ツール。  
-数学的に美しいヘアーをボタン操作だけで作る。最後の仕上げは Blender スカルプトで。
+**床屋（Tokoya）**: Blender 5.1用ヘアースタイリング・アニメーション拡張。
+UVマスク植毛、静的整髪、メッシュカット、CUDAアニメーション録画を提供する。
 
 **Katsura との違い**:
 
 | Katsura | Tokoya |
 |---|---|
-| アニメーション物理シミュレーション | 1フレーム静的スタイリング |
-| frame_change_post ハンドラ有り | ハンドラなし |
-| RAM ベイクバッファ有り | バッファなし |
-| BYPASS/SIMULATING/PLAYBACK モード | モード概念なし |
-| 35,792粒子リアルタイム | ボタンを押すたびN回実行 |
+| 研究用の旧VBD/Warp構成 | Taichi XPBD、CUDA/Vulkan/CPU |
+| 固定対象・旧8点ストランド | 選択Body、9点非等間隔ストランド |
+| RAMベイク中心 | RAM録画＋圧縮外部キャッシュ |
+| Start/Stop/Bypass | RECトグル＋自動PLAYBACK |
+| リアルタイム志向 | 正確な逐次フレーム計算、非リアルタイム可 |
 
 ---
 
-## アーキテクチャ (v0.2.5)
+## アーキテクチャ (v0.4.2)
 
 ```
-_sim_taichi.py        — Taichi XPBD ソルバー（Katsura から無改変）
-_world_passthrough.py — シングルショット run_simulation(name, n_steps, scene)
-_spiral_plant.py      — Vogel螺旋植毛（spiral-hair-build v5 から改造）
-_mesh_ops.py          — 幾何学操作（shrink/extend/urchin_reset/extend_length）
-__init__.py           — 6オペレーター + WMプロパティ登録
+_sim_taichi.py        — Taichi XPBDソルバー、可変9点、動く毛根・毛包方向
+_world_passthrough.py — 現在フレームの静的SimulateとBody衝突
+_recording.py         — REC/PLAYBACK、フレーム補間、RAM・NPZキャッシュ
+_mask_plant.py        — UVグレースケールマスク植毛
+_mesh_ops.py          — Mesh Shrink、Urchin Reset
+__init__.py           — Operator、WM Property、persistent handler
 ui.py                 — Tokoya N-パネル
 tokoya_defaults.json  — 物理パラメーターデフォルト
-blender_manifest.toml — version=0.2.5（次回インストール時にバンプ必須）
+blender_manifest.toml — 拡張manifestと配布対象
 ```
 
 ### WM プロパティ一覧

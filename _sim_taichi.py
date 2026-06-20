@@ -85,8 +85,10 @@ def get_solver_class(backend: str = "CUDA"):
             bend_shape     = (n_strands, max(pps - 2, 1))
             self.bend_rest = ti.field(dtype=ti.f32, shape=bend_shape)
 
-            # Root positions written by Python before each substep
+            # Kinematic follicle points written by Python before each substep.
+            # Point 0 is the root and point 1 locks the growth direction.
             self.roots      = ti.Vector.field(3, dtype=ti.f32, shape=n_strands)
+            self.point1s    = ti.Vector.field(3, dtype=ti.f32, shape=n_strands)
 
             # Rest offset from root (point 0) to point 1 in world coords,
             # captured at Start. Point 1 is kinematic: driven as
@@ -139,6 +141,10 @@ def get_solver_class(backend: str = "CUDA"):
             # Initialise roots field from init_pos
             root_np = np.ascontiguousarray(pos_f[np.arange(ns)*pps], dtype=np.float32)
             self.roots.from_numpy(root_np)
+            point1_np = np.ascontiguousarray(
+                pos_f[np.arange(ns)*pps + 1], dtype=np.float32
+            )
+            self.point1s.from_numpy(point1_np)
 
         # ------------------------------------------------------------------ #
         # Kernels — scalar arguments only
@@ -161,8 +167,8 @@ def get_solver_class(backend: str = "CUDA"):
                     self.pos[i]      = self.roots[s]
                     self.pos_pred[i] = self.roots[s]
                 elif k == 1:
-                    # Follicle anchor: translates with root, keeps rest direction.
-                    p1 = self.roots[s] + self.seg1_offset[s]
+                    # Follicle anchor follows the evaluated surface direction.
+                    p1 = self.point1s[s]
                     self.pos[i]      = p1
                     self.pos_pred[i] = p1
                 else:
@@ -271,6 +277,7 @@ def get_solver_class(backend: str = "CUDA"):
             bend_ke:         float,
             damping:         float,
             bending_enabled: bool,
+            new_point1_world = None,         # (n_strands, 3), optional
             body_collision_fn = None,       # callable(pred_np) → None, or None
             post_collision_iterations: int = 4,
         ) -> np.ndarray:
@@ -283,10 +290,17 @@ def get_solver_class(backend: str = "CUDA"):
             """
             dt_sub   = float(dt) / float(n_substeps)
             roots_np = np.ascontiguousarray(new_root_world, dtype=np.float32)
+            if new_point1_world is None:
+                point1_np = roots_np + self.seg1_offset.to_numpy()
+            else:
+                point1_np = np.ascontiguousarray(
+                    new_point1_world, dtype=np.float32
+                )
             do_bend  = int(bending_enabled)
 
             for _ in range(n_substeps):
                 self.roots.from_numpy(roots_np)
+                self.point1s.from_numpy(point1_np)
                 self._predict(dt_sub, float(gravity))
                 for _ in range(n_iter):
                     self._solve_springs(dt_sub, float(seg_ke),

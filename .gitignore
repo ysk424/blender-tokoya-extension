@@ -9,6 +9,9 @@ __pycache__/
 # Build / package outputs
 build/
 dist/
+tests/*.blend
+tests/*.blend1
+tests/*.tokoya-cache.npz
 *.zip
 *.egg-info/
 

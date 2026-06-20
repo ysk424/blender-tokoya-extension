@@ -57,6 +57,22 @@ class TOKOYA_PT_main(Panel):
         col.operator("tokoya.plant_hair",  icon="OUTLINER_OB_CURVES")
         col.operator("tokoya.hair_remove",  icon="TRASH")
         col.operator("tokoya.simulate",     icon="PLAY")
+
+        box = layout.box()
+        box.label(text="Animation")
+        col = box.column(align=True)
+        col.prop(wm, "tokoya_frame_interpolation")
+        recording = getattr(wm, "tokoya_record_mode", "PLAYBACK") == "RECORDING"
+        row = col.row(align=True)
+        row.alert = recording
+        row.operator(
+            "tokoya.record",
+            text="REC" if not recording else "REC ●",
+            icon="REC",
+            depress=recording,
+        )
+
+        col = layout.column(align=True)
         col.separator()
         col.operator("tokoya.mesh_shrink",  icon="MOD_SOLIDIFY")
         col.separator()
