@@ -616,3 +616,29 @@ origin への push はユーザー未承認。
 Owner: `azoo` / `ysk424` (ysk424@hotmail.com)  
 Communication: 主に日本語  
 Platform: Windows 11, RTX 5070 Ti, Blender 5.1
+
+---
+
+## 2026-06-27 Tokoya v0.6.0 作業記録
+
+- v0.6.0として、長髪向けの点数自動選択を実装した。
+  - `points = clamp(9 + floor((Max Length cm - 20) / 10), 9, 13)`
+  - 60 cmでは13点/strand。
+- 植毛時の点配置をNatural Root Spacingへ変更した。
+  - 最大長の毛は比率`1.22`の等比配置。
+  - 短い毛は最長毛基準の根元2セグメントを共有し、残りを均等割り。
+  - Root Zoneより短い毛は全体を圧縮。
+- `Mesh Shrink`は可変点数対応にした。
+  - 交差判定は従来通りevaluated worldで行う。
+  - 切れた毛だけを現在カーブ上でNatural Root Spacingに再サンプリングする。
+  - Mesh ShrinkはUNI化しない。
+- `Urchin Reset` / UI表示上のUNI不具合を修正した。
+  - 以前はローカル座標で直線化していたため、Surface Deform後の表示では一部が曲がって残った。
+  - 修正後はevaluated worldで直線化し、点ごとのSurface Deform offsetを引いてローカルへ書き戻す。
+  - MCP確認では6000本、13点/strand、evaluated表示の最大直線誤差は約0.00045 mm、0.01 mm超の残り0本。
+- Hair RemoveとREC/Animation録画機能を削除した。
+  - `_recording.py`を削除。
+  - Animationパネルは空にした。
+  - 静的な`Simulate`は、長さを見るための重力落下用途として維持。
+- `dist/tokoya-0.6.0.zip`を作成した。
+- MCPは最後に切断されたため、Codex側から`.blend`保存はできなかった。ユーザー側で終了処理中。

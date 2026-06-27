@@ -23,7 +23,7 @@ from __future__ import annotations
 import bpy
 import numpy as np
 
-POINTS_PER_STRAND = 9  # must match _mask_plant.POINTS_PER_STRAND
+POINTS_PER_STRAND = 9
 
 SPRING_KE              = 1e4
 DAMPING                = 0.05
@@ -79,12 +79,17 @@ def run_simulation(curves_obj_name: str, n_steps: int,
     n_total = len(attr.data)
     if n_total == 0:
         return 'ERROR: Curves object has no points'
-    if n_total % POINTS_PER_STRAND != 0:
+    n_curves = len(obj.data.curves)
+    if n_curves <= 0 or n_total % n_curves != 0:
         return (f'ERROR: n_total={n_total} not divisible by '
-                f'POINTS_PER_STRAND={POINTS_PER_STRAND}')
+                f'n_curves={n_curves}')
 
-    n_strands    = n_total // POINTS_PER_STRAND
-    root_indices = np.arange(n_strands, dtype=np.int32) * POINTS_PER_STRAND
+    points_per_strand = n_total // n_curves
+    if points_per_strand < 3:
+        return f'ERROR: points_per_strand={points_per_strand} must be at least 3'
+
+    n_strands    = n_curves
+    root_indices = np.arange(n_strands, dtype=np.int32) * points_per_strand
     dt = float(scene.render.fps_base) / float(scene.render.fps)
 
     dg       = bpy.context.evaluated_depsgraph_get()
@@ -102,10 +107,10 @@ def run_simulation(curves_obj_name: str, n_steps: int,
     prot_mask = np.zeros(n_total, dtype=bool)
     if protected_indices is not None and len(protected_indices) > 0:
         for si in protected_indices:
-            b = int(si) * POINTS_PER_STRAND
-            prot_mask[b:b + POINTS_PER_STRAND] = True
+            b = int(si) * points_per_strand
+            prot_mask[b:b + points_per_strand] = True
     prot_init = eval_w[prot_mask].copy() if prot_mask.any() else None
-    n_prot    = int(prot_mask.sum()) // POINTS_PER_STRAND
+    n_prot    = int(prot_mask.sum()) // points_per_strand
     if n_prot > 0:
         print(f'[tokoya/sim] {n_prot} strands protected (frozen inside primitive)')
 
@@ -115,7 +120,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
         solver = cls(
             n_total         = n_total,
             n_strands       = n_strands,
-            pps             = POINTS_PER_STRAND,
+            pps             = points_per_strand,
             init_pos        = curr_world,
             particle_mass   = PARTICLE_MASS,
             bending_enabled = BENDING_ENABLED,
@@ -136,7 +141,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
             warp_collision = WarpBodyCollider(
                 body_name=BODY_COLLISION_TARGET,
                 n_total=n_total,
-                points_per_strand=POINTS_PER_STRAND,
+                points_per_strand=points_per_strand,
                 margin=COLLISION_MARGIN,
                 search_distance=COLLISION_SEARCH,
             )
@@ -145,7 +150,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
             solver = WarpXPBDSolver(
                 n_total=n_total,
                 n_strands=n_strands,
-                pps=POINTS_PER_STRAND,
+                pps=points_per_strand,
                 init_pos=curr_world,
                 particle_mass=PARTICLE_MASS,
                 bending_enabled=BENDING_ENABLED,
@@ -224,8 +229,8 @@ def run_simulation(curves_obj_name: str, n_steps: int,
         cleanup_passes = 4 if final_cleanup else 1
         for _ in range(cleanup_passes):
             for strand in range(n_strands):
-                base = strand * POINTS_PER_STRAND
-                for segment in range(POINTS_PER_STRAND - 1):
+                base = strand * points_per_strand
+                for segment in range(points_per_strand - 1):
                     i = base + segment
                     j = i + 1
                     p0 = Vector(pred_np[i].tolist())

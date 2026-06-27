@@ -55,29 +55,10 @@ class TOKOYA_PT_main(Panel):
         # Main buttons
         col = layout.column(align=True)
         col.operator("tokoya.plant_hair",  icon="OUTLINER_OB_CURVES")
-        col.operator("tokoya.hair_remove",  icon="TRASH")
         col.operator("tokoya.simulate",     icon="PLAY")
 
         box = layout.box()
         box.label(text="Animation")
-        col = box.column(align=True)
-        col.prop(wm, "tokoya_auto_frame_interpolation")
-        row = col.row(align=True)
-        row.enabled = not wm.tokoya_auto_frame_interpolation
-        row.prop(wm, "tokoya_frame_interpolation")
-        if wm.tokoya_auto_frame_interpolation:
-            col.label(
-                text=f"Auto Steps: {wm.tokoya_auto_interpolation_current}"
-            )
-        recording = getattr(wm, "tokoya_record_mode", "PLAYBACK") == "RECORDING"
-        row = col.row(align=True)
-        row.alert = recording
-        row.operator(
-            "tokoya.record",
-            text="REC" if not recording else "REC ●",
-            icon="REC",
-            depress=recording,
-        )
 
         col = layout.column(align=True)
         col.separator()
@@ -96,8 +77,6 @@ class TOKOYA_PT_main(Panel):
         col.prop(wm, "tokoya_gravity")
         col.separator()
         col.prop(wm, "tokoya_iterations")
-        col.prop(wm, "tokoya_interpolation_mag")
-        col.separator()
         col.prop(wm, "tokoya_bending_enabled")
         if getattr(wm, "tokoya_bending_enabled", False):
             col.prop(wm, "tokoya_root_bending_ke")

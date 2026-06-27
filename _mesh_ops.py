@@ -22,7 +22,7 @@ import numpy as np
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
-_PPC = 9  # must match _mask_plant.POINTS_PER_STRAND
+_PPC = 9
 
 
 # ------------------------------------------------------------------ #
@@ -45,6 +45,16 @@ def _write_local(curves_obj: bpy.types.Object, local_pts: np.ndarray) -> None:
     curves_obj.data.update_tag()
 
 
+def _points_per_curve(curves_obj: bpy.types.Object) -> int:
+    n_curves = len(curves_obj.data.curves)
+    n_points = len(curves_obj.data.points)
+    if n_curves <= 0 or n_points <= 0:
+        raise RuntimeError("Curves object has no strands")
+    if n_points % n_curves:
+        raise RuntimeError("All strands must have the same point count")
+    return n_points // n_curves
+
+
 def _read_world_eval(curves_obj: bpy.types.Object) -> np.ndarray:
     """Return (n_total, 3) float32 in WORLD space — uses evaluated mesh
     so the Surface Deform modifier offset is included.
@@ -64,6 +74,29 @@ def _read_world_eval(curves_obj: bpy.types.Object) -> np.ndarray:
     return (lh @ mw.T)[:, :3].astype(np.float32, copy=True)
 
 
+def _read_world_original(curves_obj: bpy.types.Object) -> np.ndarray:
+    """Return unevaluated Curves positions in world space."""
+    local_pts = _read_local(curves_obj)
+    n = len(local_pts)
+    mw = np.array(curves_obj.matrix_world, dtype=np.float32)
+    lh = np.column_stack([local_pts, np.ones(n, dtype=np.float32)])
+    return (lh @ mw.T)[:, :3].astype(np.float32, copy=True)
+
+
+def _write_world_with_eval_offset(
+    curves_obj: bpy.types.Object,
+    target_eval_world: np.ndarray,
+    offset_world: np.ndarray,
+) -> None:
+    """Write points so evaluated display matches target_eval_world."""
+    n = len(target_eval_world)
+    write_world = target_eval_world - offset_world
+    mw_inv = np.array(curves_obj.matrix_world.inverted(), dtype=np.float32)
+    wh = np.column_stack([write_world, np.ones(n, dtype=np.float32)])
+    local_pts = (wh @ mw_inv.T)[:, :3].astype(np.float32, copy=True)
+    _write_local(curves_obj, local_pts)
+
+
 def _build_bvh(ref_mesh_obj: bpy.types.Object) -> BVHTree:
     """Build a world-space BVHTree from the evaluated ref mesh."""
     deps     = bpy.context.evaluated_depsgraph_get()
@@ -80,6 +113,27 @@ def _build_bvh(ref_mesh_obj: bpy.types.Object) -> BVHTree:
 def _arc_length(pts_3d: np.ndarray) -> float:
     """Sum of segment lengths for one strand."""
     return float(np.sum(np.linalg.norm(np.diff(pts_3d, axis=0), axis=1)))
+
+
+def _resample_polyline(pts_3d: np.ndarray, distances: list[float]) -> np.ndarray:
+    arcs = np.zeros(len(pts_3d), dtype=np.float64)
+    for index in range(1, len(pts_3d)):
+        arcs[index] = arcs[index - 1] + float(
+            np.linalg.norm(pts_3d[index] - pts_3d[index - 1])
+        )
+    total = arcs[-1]
+    if total < 1.0e-9:
+        return pts_3d.copy()
+
+    result = np.empty_like(pts_3d)
+    for out_index, distance in enumerate(distances):
+        target = min(total, max(0.0, float(distance)))
+        seg = int(np.searchsorted(arcs, target, side="right") - 1)
+        seg = max(0, min(seg, len(pts_3d) - 2))
+        span = arcs[seg + 1] - arcs[seg]
+        t = 0.0 if span <= 1.0e-9 else (target - arcs[seg]) / span
+        result[out_index] = pts_3d[seg] * (1.0 - t) + pts_3d[seg + 1] * t
+    return result
 
 
 def _ray_cast_bidir(bvh: BVHTree, p0: Vector, p1: Vector):
@@ -115,25 +169,30 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
     """Shrink each strand to its first intersection with ref_mesh.
 
     Uses EVALUATED world positions so the Surface Deform modifier is
-    accounted for.  Segment-by-segment walk from root → tip; bidirectional
+    accounted for. Segment-by-segment walk from root to tip; bidirectional
     ray cast so back-face planes are also caught.
 
-    scale = arc_length_to_intersection / total_arc_length
-    Applied to LOCAL positions (correct because scale is dimensionless).
+    Cut strands are re-sampled along their current curve with Natural Root
+    Spacing. Mesh Shrink only cuts strands and does not act as UNI.
 
     Returns number of strands shrunk.
     """
     bvh   = _build_bvh(ref_mesh_obj)
     local = _read_local(curves_obj)
     world = _read_world_eval(curves_obj)   # ← evaluated, not local-to-world
-    n_c   = len(local) // _PPC
+    ppc = _points_per_curve(curves_obj)
+    n_c = len(local) // ppc
+    original_lengths = [
+        _arc_length(local[ci * ppc:ci * ppc + ppc]) for ci in range(n_c)
+    ]
+    max_length = max(original_lengths) if original_lengths else 0.0
     shrunk = 0
 
     for ci in range(n_c):
-        b    = ci * _PPC
+        b    = ci * ppc
         # Cumulative arc-lengths in evaluated world space
-        arcs = np.zeros(_PPC, dtype=np.float64)
-        for j in range(1, _PPC):
+        arcs = np.zeros(ppc, dtype=np.float64)
+        for j in range(1, ppc):
             arcs[j] = arcs[j - 1] + float(
                 np.linalg.norm(world[b + j] - world[b + j - 1]))
         total = arcs[-1]
@@ -145,7 +204,7 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
         # capsule, etc.) where the strand crosses the surface TWICE: we always
         # want the intersection NEAREST to the root (shorter side).
         all_hits = []
-        for seg in range(_PPC - 1):
+        for seg in range(ppc - 1):
             p0 = Vector(world[b + seg    ].tolist())
             p1 = Vector(world[b + seg + 1].tolist())
             dist, _ = _ray_cast_bidir(bvh, p0, p1)
@@ -159,9 +218,10 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
             continue  # intersection is beyond tip — nothing to cut
 
         scale = hit_arc / total
-        root  = local[b].copy()
-        for j in range(1, _PPC):
-            local[b + j] = root + (local[b + j] - root) * scale
+        from . import _mask_plant
+        new_length = original_lengths[ci] * scale
+        distances = _mask_plant.natural_distances(new_length, max_length, ppc)
+        local[b:b + ppc] = _resample_polyline(local[b:b + ppc], distances)
         shrunk += 1
 
     _write_local(curves_obj, local)
@@ -176,23 +236,33 @@ def urchin_reset(curves_obj: bpy.types.Object) -> int:
 
     Returns number of strands reset.
     """
-    local = _read_local(curves_obj)
-    n_c   = len(local) // _PPC
+    from . import _mask_plant
+
+    eval_world = _read_world_eval(curves_obj)
+    orig_world = _read_world_original(curves_obj)
+    offset_world = eval_world - orig_world
+    ppc = _points_per_curve(curves_obj)
+    n_c = len(eval_world) // ppc
+    lengths = [
+        _arc_length(eval_world[ci * ppc:ci * ppc + ppc])
+        for ci in range(n_c)
+    ]
+    max_length = max(lengths) if lengths else 0.0
+    target_world = eval_world.copy()
 
     for ci in range(n_c):
-        b         = ci * _PPC
-        root      = local[b].copy()
-        follicle  = local[b + 1]
+        b         = ci * ppc
+        root      = eval_world[b].copy()
+        follicle  = eval_world[b + 1]
         direction = follicle - root
         d_len     = float(np.linalg.norm(direction))
         if d_len < 1e-6:
             continue
         direction /= d_len
 
-        arc_len = _arc_length(local[b:b + _PPC])
-        seg     = arc_len / (_PPC - 1)
-        for j in range(1, _PPC):
-            local[b + j] = root + direction * (seg * j)
+        distances = _mask_plant.natural_distances(lengths[ci], max_length, ppc)
+        for j in range(1, ppc):
+            target_world[b + j] = root + direction * distances[j]
 
-    _write_local(curves_obj, local)
+    _write_world_with_eval_offset(curves_obj, target_world, offset_world)
     return n_c

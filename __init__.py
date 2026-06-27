@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json, math, os
 import bpy
-from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty,
     IntProperty, StringProperty,
@@ -35,9 +34,8 @@ def _find_curves_obj():
     return objs[0] if len(objs) == 1 else None
 
 
-def _clear_recording_cache():
-    from . import _recording
-    _recording.manager.clear()
+def _mark_hair_changed():
+    return None
 
 
 class TOKOYA_OT_create_head_mask(Operator):
@@ -110,23 +108,7 @@ class TOKOYA_OT_plant_hair(Operator):
         self.report({"INFO"},
             f"Planted {r['n_added']} strands / {r['total_points']} points. "
             f"Mean length {r['mean_length_cm']:.1f} cm")
-        _clear_recording_cache()
-        return {"FINISHED"}
-
-
-class TOKOYA_OT_hair_remove(Operator):
-    bl_idname = "tokoya.hair_remove"
-    bl_label = "Hair Remove"
-    bl_description = "Remove all strands while preserving the Curves object and surface setup"
-
-    def execute(self, context):
-        obj = _find_curves_obj()
-        if obj is None:
-            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
-        from . import _mask_plant
-        removed = _mask_plant.remove_all_hair(obj)
-        _clear_recording_cache()
-        self.report({"INFO"}, f"Removed {removed} strands")
+        _mark_hair_changed()
         return {"FINISHED"}
 
 
@@ -154,27 +136,8 @@ class TOKOYA_OT_simulate(Operator):
         )
         if status.startswith("ERROR"):
             self.report({"ERROR"}, status); return {"CANCELLED"}
-        _clear_recording_cache()
+        _mark_hair_changed()
         self.report({"INFO"}, status)
-        return {"FINISHED"}
-
-
-class TOKOYA_OT_record(Operator):
-    bl_idname = "tokoya.record"
-    bl_label = "REC"
-    bl_description = (
-        "Toggle timeline recording. Recording advances only on consecutive "
-        "forward frames; reverse playback or a frame jump aborts to playback"
-    )
-
-    def execute(self, context):
-        _snapshot_sim_params(context.window_manager)
-        from . import _recording
-        ok, message = _recording.manager.toggle(context.scene)
-        if not ok:
-            self.report({"ERROR"}, message)
-            return {"CANCELLED"}
-        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -198,7 +161,7 @@ class TOKOYA_OT_mesh_shrink(Operator):
             return {"CANCELLED"}
         from . import _mesh_ops
         n = _mesh_ops.mesh_shrink(obj, ref)
-        _clear_recording_cache()
+        _mark_hair_changed()
         self.report({"INFO"}, f"Shrunk {n} strands")
         return {"FINISHED"}
 
@@ -214,7 +177,7 @@ class TOKOYA_OT_urchin_reset(Operator):
             self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
         from . import _mesh_ops
         n = _mesh_ops.urchin_reset(obj)
-        _clear_recording_cache()
+        _mark_hair_changed()
         self.report({"INFO"}, f"Urchin reset: {n} strands")
         return {"FINISHED"}
 
@@ -255,9 +218,7 @@ class TOKOYA_OT_pick_cutter(Operator):
 _classes = (
     TOKOYA_OT_create_head_mask,
     TOKOYA_OT_plant_hair,
-    TOKOYA_OT_hair_remove,
     TOKOYA_OT_simulate,
-    TOKOYA_OT_record,
     TOKOYA_OT_mesh_shrink,
     TOKOYA_OT_urchin_reset,
     TOKOYA_OT_pick_body,
@@ -265,45 +226,12 @@ _classes = (
 )
 
 
-@persistent
-def _on_frame_change_post(scene, _depsgraph):
-    from . import _recording
-    _recording.manager.on_frame_change(scene)
-
-
-@persistent
-def _on_save_post(_filepath):
-    from . import _recording
-    _recording.manager.save_cache()
-
-
-@persistent
-def _on_load_post(_filepath):
-    from . import _recording
-    if _recording.manager.load_cache():
-        _recording.manager.restore(bpy.context.scene, bpy.context.scene.frame_current)
-
-
 def _install_handlers():
-    handlers = (
-        (bpy.app.handlers.frame_change_post, _on_frame_change_post),
-        (bpy.app.handlers.save_post, _on_save_post),
-        (bpy.app.handlers.load_post, _on_load_post),
-    )
-    for collection, handler in handlers:
-        if handler not in collection:
-            collection.append(handler)
+    return None
 
 
 def _uninstall_handlers():
-    handlers = (
-        (bpy.app.handlers.frame_change_post, _on_frame_change_post),
-        (bpy.app.handlers.save_post, _on_save_post),
-        (bpy.app.handlers.load_post, _on_load_post),
-    )
-    for collection, handler in handlers:
-        if handler in collection:
-            collection.remove(handler)
+    return None
 
 
 def register():
@@ -327,39 +255,6 @@ def register():
         WindowManager.tokoya_simulation_steps = IntProperty(
             name="Simulation Steps", description="Number of XPBD simulation steps",
             default=20, min=1, max=500, options={"SKIP_SAVE"})
-        WindowManager.tokoya_frame_interpolation = IntProperty(
-            name="Frame Interpolation",
-            description=(
-                "Physics evaluations between animation frames. Increase when "
-                "fast Body motion causes tunneling"
-            ),
-            default=2, min=1, max=64, options={"SKIP_SAVE"})
-        WindowManager.tokoya_auto_frame_interpolation = BoolProperty(
-            name="Auto Frame Interpolation",
-            description=(
-                "Choose 1-64 interpolation steps from root motion and "
-                "median root spacing"
-            ),
-            default=True, options={"SKIP_SAVE"})
-        WindowManager.tokoya_auto_interpolation_current = IntProperty(
-            name="Auto Steps", default=1, min=1, max=1024,
-            options={"SKIP_SAVE"})
-        WindowManager.tokoya_interpolation_mag = IntProperty(
-            name="Interpolation Mag",
-            description=(
-                "Multiply Auto or manual Frame Interpolation by this value"
-            ),
-            default=int(defaults["INTERPOLATION_MAG"]),
-            min=1, max=16, options={"SKIP_SAVE"})
-        WindowManager.tokoya_record_mode = EnumProperty(
-            name="Recording Mode",
-            items=(
-                ("PLAYBACK", "Playback", "Play cached frames without simulation"),
-                ("RECORDING", "Recording", "Simulate and cache forward frames"),
-            ),
-            default="PLAYBACK",
-            options={"SKIP_SAVE"},
-        )
         WindowManager.tokoya_compute_backend = EnumProperty(
             name="Compute",
             description="Taichi compute backend; changing it rebuilds the solver",
@@ -406,11 +301,6 @@ def register():
         ui_registered = True
         _install_handlers()
         handlers_installed = True
-        from . import _recording
-        if _recording.manager.load_cache():
-            scene = getattr(bpy.context, "scene", None)
-            if scene is not None:
-                _recording.manager.restore(scene, scene.frame_current)
     except Exception:
         if handlers_installed:
             _uninstall_handlers()
@@ -421,11 +311,7 @@ def register():
                 pass
         for name in (
             "tokoya_strand_count", "tokoya_max_length_cm",
-            "tokoya_simulation_steps", "tokoya_frame_interpolation",
-            "tokoya_auto_frame_interpolation",
-            "tokoya_auto_interpolation_current",
-            "tokoya_interpolation_mag",
-            "tokoya_record_mode", "tokoya_compute_backend",
+            "tokoya_simulation_steps", "tokoya_compute_backend",
             "tokoya_body_obj", "tokoya_cutter_obj",
             "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
             "tokoya_gravity", "tokoya_iterations",
@@ -446,16 +332,10 @@ def register():
 
 def unregister():
     _uninstall_handlers()
-    from . import _recording
-    _recording.manager.stop("extension unregister")
     ui.unregister()
     for name in (
         "tokoya_strand_count", "tokoya_max_length_cm",
-        "tokoya_simulation_steps", "tokoya_frame_interpolation",
-        "tokoya_auto_frame_interpolation",
-        "tokoya_auto_interpolation_current",
-        "tokoya_interpolation_mag",
-        "tokoya_record_mode", "tokoya_compute_backend",
+        "tokoya_simulation_steps", "tokoya_compute_backend",
         "tokoya_body_obj", "tokoya_cutter_obj",
         "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
         "tokoya_gravity", "tokoya_iterations",

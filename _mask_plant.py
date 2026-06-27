@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from array import array
 import bisect
+import math
 import random
 
 import bpy
@@ -10,8 +11,61 @@ from mathutils import Matrix, Vector
 
 
 POINTS_PER_STRAND = 9
-ROOT_DENSITY_EXPONENT = 1.7
+MIN_POINTS_PER_STRAND = 9
+MAX_POINTS_PER_STRAND = 13
+NATURAL_SPACING_RATIO = 1.22
+COMMON_ROOT_SEGMENTS = 2
 MIN_DARKNESS = 1.0 / 255.0
+
+
+def points_per_strand_for_length(max_length_cm: float) -> int:
+    """Choose one uniform strand point count from the requested max length."""
+    return max(
+        MIN_POINTS_PER_STRAND,
+        min(
+            MAX_POINTS_PER_STRAND,
+            MIN_POINTS_PER_STRAND + math.floor((max_length_cm - 20.0) / 10.0),
+        ),
+    )
+
+
+def natural_distances(length_m: float, max_length_m: float, pps: int) -> list[float]:
+    """Return monotonic distances from root for one strand.
+
+    The first two segments use the max-length root zone when the strand is
+    long enough. Shorter gray-mask or Mesh Shrink strands keep that common
+    root zone, then distribute their remaining tail evenly.
+    """
+    if pps < 2:
+        return [0.0]
+    length_m = max(0.0, float(length_m))
+    max_length_m = max(length_m, float(max_length_m), 1.0e-9)
+    segments = [NATURAL_SPACING_RATIO ** i for i in range(pps - 1)]
+    total = sum(segments)
+    max_distances = [0.0]
+    acc = 0.0
+    for segment in segments:
+        acc += segment
+        max_distances.append(max_length_m * acc / total)
+
+    root_index = min(COMMON_ROOT_SEGMENTS, pps - 1)
+    root_zone = max_distances[root_index]
+    if length_m >= max_length_m - 1.0e-9:
+        return max_distances
+    if length_m <= root_zone + 1.0e-9:
+        scale = length_m / root_zone if root_zone > 1.0e-9 else 0.0
+        return [min(length_m, distance * scale) for distance in max_distances]
+
+    distances = [0.0] * pps
+    for index in range(root_index + 1):
+        distances[index] = max_distances[index]
+
+    remaining_points = pps - root_index - 1
+    if remaining_points > 0:
+        step = (length_m - root_zone) / remaining_points
+        for offset in range(1, remaining_points + 1):
+            distances[root_index + offset] = root_zone + step * offset
+    return distances
 
 
 def create_head_mask(
@@ -305,8 +359,10 @@ def plant_mask_hair(
             f"Could only place {len(roots)} of {strand_count} strands"
         )
 
+    points_per_strand = points_per_strand_for_length(max_length_cm)
+
     curves = curves_obj.data
-    curves.add_curves([POINTS_PER_STRAND] * strand_count)
+    curves.add_curves([points_per_strand] * strand_count)
     position = curves.attributes["position"]
     if "surface_uv_coordinate" not in curves.attributes:
         curves.attributes.new(
@@ -317,10 +373,9 @@ def plant_mask_hair(
     for curve_index, (root, normal, length, uv) in enumerate(
         zip(roots, normals, lengths, root_uvs)
     ):
-        first = curve_index * POINTS_PER_STRAND
-        for point_index in range(POINTS_PER_STRAND):
-            normalized_index = point_index / (POINTS_PER_STRAND - 1)
-            distance = length * normalized_index ** ROOT_DENSITY_EXPONENT
+        first = curve_index * points_per_strand
+        distances = natural_distances(length, max_length_m, points_per_strand)
+        for point_index, distance in enumerate(distances):
             position.data[first + point_index].vector = root + normal * distance
         surface_uv.data[curve_index].vector = uv
 
@@ -330,8 +385,8 @@ def plant_mask_hair(
     lengths_cm = [length * 100.0 for length in lengths]
     return {
         "n_added": strand_count,
-        "total_points": strand_count * POINTS_PER_STRAND,
-        "points_per_strand": POINTS_PER_STRAND,
+        "total_points": strand_count * points_per_strand,
+        "points_per_strand": points_per_strand,
         "max_length_cm": max(lengths_cm),
         "mean_length_cm": sum(lengths_cm) / len(lengths_cm),
         "mask_image": image.name,
