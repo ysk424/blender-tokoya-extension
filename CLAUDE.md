@@ -23,32 +23,15 @@ ear-area collision shape does not exactly match the visible Body mesh.
 
 ---
 
-## v0.6.2 Yurameki Settle migration (2026-07-05)
+## v0.6.2 Settle migration note (2026-07-05, superseded)
 
-Long straight hair setup is now split by responsibility:
+The old `tokoya.simulate` button was replaced with `Settle Hair Back`, and Hair,
+Body, Clothes, and Cutter pickers were added. The old detailed migration note
+has been intentionally removed because it encouraged future debugging to trust
+the migration path instead of re-auditing coordinate spaces.
 
-- Tokoya owns planting, cutting, reset, and initial grooming.
-- Yurameki owns time simulation only.
-
-Reason: Yurameki's `Settle Hair Back` was not a real simulation step. It was a
-CPU BVH initial groom that preserved the top-of-head curve while laying long
-straight hair behind the body and downward. Keeping that operation in Yurameki
-mixed grooming with simulation and made the solver direction harder to reason
-about. Moving it to Tokoya keeps the beautiful initial shape as a grooming
-asset, then Yurameki can simulate that already-settled state.
-
-Implementation:
-
-- The old `tokoya.simulate` button label and behavior were replaced with
-  `Settle Hair Back`.
-- Yurameki's `initial_groom.py` and `collider_proxy.py` were copied exactly as
-  `_initial_groom.py` and `_collider_proxy.py`; hashes matched the Yurameki
-  source at migration time.
-- Hair, Body, Clothes, and Cutter pickers were added. Plant, Settle, Shrink,
-  and Urchin Reset now use the selected Hair Curves object.
-- When Settle runs, Tokoya reuses a valid filled Body proxy if one exists. If
-  none exists, it builds one automatically before grooming.
-- The user verified the migrated Settle path works in Blender.
+Use the v0.6.3 note above as authoritative for Settle behavior: collision and
+grooming decisions must match the visible evaluated Curves coordinates.
 
 ---
 
