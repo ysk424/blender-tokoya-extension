@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.6.9"
+version = "0.7.0"
 name = "Tokoya"
 tagline = "Mask planting and long-hair grooming"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
@@ -13,7 +13,7 @@ license = ["SPDX:MIT"]
 
 tags = ["Physics"]
 
-platforms = ["windows-x64"]
+platforms = ["windows-x64", "macos-arm64"]
 
 [build]
 paths = [

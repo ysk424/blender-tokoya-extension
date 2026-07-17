@@ -8,11 +8,11 @@ simulates the groomed Curves object.
 
 ## Current Release
 
-- Version: 0.6.9.
+- Version: 0.7.0.
 - Tested workflow target: Blender 5.2 beta.
-- Platform target: Windows x64.
+- Platform target: Windows x64 and macOS arm64.
 - License: MIT.
-- Release package: `dist/tokoya-0.6.9.zip`.
+- Release package: `dist/tokoya-0.7.0.zip`.
 
 ## Current Direction
 

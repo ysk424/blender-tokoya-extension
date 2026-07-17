@@ -1,4 +1,4 @@
-# Tokoya 0.6.9
+# Tokoya 0.7.0
 
 Tokoya is a Blender extension for generating and preparing
 VR-character-style long straight hair from a grayscale scalp mask.
@@ -9,13 +9,27 @@ and settles the hair; Yurameki then simulates the already-groomed Curves object.
 ## Installation
 
 - Blender 5.1 or newer. Current workflow testing is on Blender 5.2 beta.
-- Windows x64.
+- Windows x64 and macOS (Apple Silicon / arm64).
 
 Install the release ZIP through Blender's extension/add-on installer:
 
 ```text
-dist/tokoya-0.6.9.zip
+dist/tokoya-0.7.0.zip
 ```
+
+The same ZIP installs on both platforms.
+
+### Dependencies
+
+Tokoya's simulation uses the `taichi` runtime, which is not bundled. After
+enabling the extension, open **Preferences → Add-ons → Tokoya** and press
+**Install Dependencies (taichi)** (requires a network connection). It installs
+`taichi` into Blender's Python user site.
+
+The compute backend defaults to **CUDA**. On hardware without CUDA (for example
+macOS) Tokoya automatically falls back to the **CPU** backend; NVIDIA/Windows
+behaviour is unchanged. Vulkan and CPU can also be selected manually in the
+N-panel.
 
 ## Main Features
 

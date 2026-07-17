@@ -19,12 +19,17 @@ _backend     = None
 def _ensure_taichi(backend: str = "CUDA"):
     global _ti, _SolverClass, _backend
     backend = backend.upper()
-    if _ti is not None and _backend == backend:
-        return _ti
     user_site = site.getusersitepackages()
     if user_site not in sys.path:
         site.addsitedir(user_site)
     import taichi as ti
+    # The macOS Taichi wheel is built without CUDA; drop to the CPU backend
+    # rather than failing to initialize. Windows/NVIDIA is unaffected.
+    if backend == "CUDA" and not ti._lib.core.with_cuda():
+        print("[tokoya/taichi] CUDA is unavailable in this Taichi build; using CPU backend")
+        backend = "CPU"
+    if _ti is not None and _backend == backend:
+        return _ti
     if _ti is not None:
         ti.reset()
         _SolverClass = None

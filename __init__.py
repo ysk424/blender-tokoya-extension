@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, math, os
+import json, math, os, sys
 import bpy
 from bpy.props import (
     BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty,
@@ -657,6 +657,61 @@ class TOKOYA_OT_pick_cutter(Operator):
         return {"FINISHED"}
 
 
+def _blender_python_exe():
+    base = os.path.join(sys.prefix, "bin")
+    win = os.path.join(base, "python.exe")
+    if os.path.exists(win):
+        return win
+    nix = os.path.join(base, "python%d.%d" % sys.version_info[:2])
+    return nix if os.path.exists(nix) else sys.executable
+
+
+def _taichi_installed():
+    import importlib.util, site
+    user_site = site.getusersitepackages()
+    if user_site not in sys.path:
+        sys.path.append(user_site)
+    return importlib.util.find_spec("taichi") is not None
+
+
+class TOKOYA_OT_install_deps(Operator):
+    bl_idname = "tokoya.install_deps"
+    bl_label = "Install Dependencies (taichi)"
+    bl_description = (
+        "Download and install the taichi runtime into the Blender Python "
+        "user site. Requires a network connection"
+    )
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        import subprocess
+        python_exe = _blender_python_exe()
+        try:
+            subprocess.run([python_exe, "-m", "ensurepip"], check=False)
+            subprocess.run(
+                [python_exe, "-m", "pip", "install", "--user", "taichi==1.7.4"],
+                check=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - report any install failure to the user
+            self.report({"ERROR"}, "taichi install failed: %s" % exc)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "taichi installed. Restart Blender if it is still not detected.")
+        return {"FINISHED"}
+
+
+class TOKOYA_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    def draw(self, context):
+        layout = self.layout
+        if _taichi_installed():
+            layout.label(text="taichi: installed", icon="CHECKMARK")
+        else:
+            layout.label(text="taichi: not found - simulation is disabled", icon="ERROR")
+        layout.operator(TOKOYA_OT_install_deps.bl_idname, icon="IMPORT")
+        layout.label(text="Installs into the Blender Python user site. Needs network access.")
+
+
 _classes = (
     TOKOYA_OT_create_head_mask,
     TOKOYA_OT_plant_hair,
@@ -669,6 +724,8 @@ _classes = (
     TOKOYA_OT_pick_body,
     TOKOYA_OT_pick_clothes,
     TOKOYA_OT_pick_cutter,
+    TOKOYA_OT_install_deps,
+    TOKOYA_AddonPreferences,
 )
 
 
